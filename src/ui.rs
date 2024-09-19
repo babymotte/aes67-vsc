@@ -15,9 +15,7 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use std::{env, io::Cursor};
-
-use crate::actor::{self, respond};
+use crate::actor::{self, respond, Actor};
 use aes67_vsc::{
     ptp::PtpApi,
     rtp::{rx::RtpRxApi, tx::RtpTxApi},
@@ -34,10 +32,8 @@ use miette::{miette, Error, IntoDiagnostic, Result};
 use pnet::{datalink, ipnetwork::IpNetwork};
 use sdp::SessionDescription;
 use serde::{Deserialize, Serialize};
-use tokio::{
-    select,
-    sync::{mpsc, oneshot},
-};
+use std::{env, io::Cursor};
+use tokio::sync::{mpsc, oneshot};
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -50,24 +46,16 @@ struct UiActor {
     ui_commands: mpsc::Receiver<UiFunction>,
 }
 
-impl UiActor {
-    async fn run(mut self) -> Result<()> {
-        loop {
-            select! {
-                _ = self.subsys.on_shutdown_requested() => break,
-                recv = self.ui_commands.recv() => {
-                    if !self.process_command(recv).await? {
-                        break;
-                    }
-                }
-            }
-        }
-
-        Ok(())
+impl Actor<UiFunction, Error> for UiActor {
+    async fn recv_command(&mut self) -> Option<UiFunction> {
+        self.ui_commands.recv().await
     }
 
-    async fn process_command(&mut self, recv: Option<UiFunction>) -> Result<bool> {
-        match recv {
+    async fn process_command(
+        &mut self,
+        command: Option<UiFunction>,
+    ) -> std::result::Result<bool, Error> {
+        match command {
             Some(f) => match f {
                 UiFunction::CreateTransmitter(sdp, tx) => {
                     respond(self.create_transmitter(sdp).await, tx).await
@@ -76,7 +64,9 @@ impl UiActor {
             None => Ok(false),
         }
     }
+}
 
+impl UiActor {
     async fn create_transmitter(&self, sdp: String) -> Result<String> {
         let sd = SessionDescription::unmarshal(&mut Cursor::new(sdp)).into_diagnostic()?;
         let session_id = self.sap.add_session(sd).await.into_diagnostic()?;
@@ -130,7 +120,9 @@ pub fn ui(
             Ok(()) as Result<()>
         }));
 
-        let actor = UiActor {
+        let cancel_toke = s.create_cancellation_token();
+
+        let mut actor = UiActor {
             ptp,
             rtp_rx,
             rtp_tx,
@@ -139,7 +131,7 @@ pub fn ui(
             ui_commands,
         };
 
-        actor.run().await?;
+        actor.run(cancel_toke).await?;
 
         Ok(()) as Result<()>
     }));
