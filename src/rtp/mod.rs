@@ -15,22 +15,8 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use aes67_vsc::UiCommandRx;
-use miette::Result;
-use tokio::{select, sync::mpsc};
-use tokio_graceful_shutdown::SubsystemHandle;
+pub mod rx;
+pub mod tx;
 
-pub async fn rtp_rx(
-    subsys: SubsystemHandle,
-    _ui_commands: mpsc::Receiver<UiCommandRx>,
-) -> Result<()> {
-    loop {
-        select! {
-            _ = subsys.on_shutdown_requested() => break,
-        }
-    }
-
-    subsys.request_shutdown();
-
-    Ok(())
-}
+pub use rx::*;
+pub use tx::*;

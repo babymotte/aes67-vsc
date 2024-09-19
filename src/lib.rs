@@ -15,54 +15,8 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum MediaType {
-    Audio,
-    Video,
-    Text,
-    Application,
-    Message,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Protocol {
-    Udp,
-    RtpAvp,
-    RtpSavp,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Aes67SenderDescriptor {
-    // o
-    username: String,
-    sess_id: String,
-    sess_version: String,
-    nettype: String,
-    addrtype: String,
-    unicast_address: String,
-    // s
-    session_name: String,
-    // t
-    start_time: u64,
-    stop_time: u64,
-    // m
-    media: MediaType,
-    port: u16,
-    proto: Protocol,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum UiCommandTx {}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum UiCommandRx {
-    Subscribe(Aes67SenderDescriptor),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum UiCommandPTP {
-    SetPrio(u16),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum UiCommandSAP {}
+pub(crate) mod actor;
+pub mod error;
+pub mod ptp;
+pub mod rtp;
+pub mod sap;

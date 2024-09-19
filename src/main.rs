@@ -15,26 +15,23 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+mod actor;
+mod ui;
+
+use aes67_vsc::{
+    ptp::PtpApi,
+    rtp::{RtpRxApi, RtpTxApi},
+    sap::SapApi,
+};
 use clap::Parser;
-use miette::Result;
-use ptp::ptp;
-use rtp_rx::rtp_rx;
-use rtp_tx::rtp_tx;
-use sap::sap;
+use miette::{IntoDiagnostic, Result};
 use std::{io, time::Duration};
 #[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
 use tikv_jemallocator::Jemalloc;
-use tokio::sync::mpsc;
-use tokio_graceful_shutdown::{SubsystemBuilder, Toplevel};
+use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle, Toplevel};
 use tracing_log::AsTrace;
 use tracing_subscriber::EnvFilter;
-use vsc_ui::vsc_ui;
-
-mod ptp;
-mod rtp_rx;
-mod rtp_tx;
-mod sap;
-mod vsc_ui;
+use ui::ui;
 
 #[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
 #[global_allocator]
@@ -46,10 +43,11 @@ struct Args {
     #[command(flatten)]
     verbose: clap_verbosity_flag::Verbosity,
     /// The port to run the web UI on
+    #[arg(short, long)]
     port: Option<u16>,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     dotenv::dotenv().ok();
 
@@ -61,24 +59,25 @@ async fn main() -> Result<()> {
         .with_max_level(args.verbose.log_level_filter().as_trace())
         .init();
 
-    let port = args.port.unwrap_or(8080);
-
     Toplevel::new(move |s| async move {
-        let (tx_tx, tx_rx) = mpsc::channel(1);
-        let (rx_tx, rx_rx) = mpsc::channel(1);
-        let (ptp_tx, ptp_rx) = mpsc::channel(1);
-        let (sap_tx, sap_rx) = mpsc::channel(1);
-        s.start(SubsystemBuilder::new("rtp-tx", |s| rtp_tx(s, tx_rx)));
-        s.start(SubsystemBuilder::new("rtp-rx", |s| rtp_rx(s, rx_rx)));
-        s.start(SubsystemBuilder::new("ptp", |s| ptp(s, ptp_rx)));
-        s.start(SubsystemBuilder::new("sap", |s| sap(s, sap_rx)));
-        s.start(SubsystemBuilder::new("vsc-ui", move |s| {
-            vsc_ui(s, tx_tx, rx_tx, ptp_tx, sap_tx, port)
-        }));
+        s.start(SubsystemBuilder::new("aes67-vsc", |s| run(args, s)));
     })
     .catch_signals()
     .handle_shutdown_requests(Duration::from_millis(1000))
     .await?;
+
+    Ok(())
+}
+
+async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
+    let port = args.port.unwrap_or(9090);
+
+    let rtp_tx = RtpTxApi::new(&subsys).into_diagnostic()?;
+    let rtp_rx = RtpRxApi::new(&subsys).into_diagnostic()?;
+    let sap = SapApi::new(&subsys).into_diagnostic()?;
+    let ptp = PtpApi::new(&subsys).into_diagnostic()?;
+
+    ui(&subsys, rtp_tx, rtp_rx, ptp, sap, port)?;
 
     Ok(())
 }

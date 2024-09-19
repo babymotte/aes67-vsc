@@ -15,50 +15,140 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use aes67_vsc::UiCommandSAP;
-use miette::{IntoDiagnostic, Result};
+use crate::{
+    actor::{self, respond, Actor},
+    error::{Aes67Error, Aes67Result, SapError},
+};
 use sap_rs::{Sap, SessionAnnouncement};
 use sdp::SessionDescription;
-use std::io::Cursor;
-use tokio::{select, sync::mpsc};
-use tokio_graceful_shutdown::SubsystemHandle;
+use std::collections::HashMap;
+use tokio::{
+    select,
+    sync::{mpsc, oneshot},
+};
+use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
 
-pub async fn sap(
+pub struct SapApi {
+    channel: mpsc::Sender<SapFunction>,
+}
+
+impl SapApi {
+    pub fn new(subsys: &SubsystemHandle) -> Aes67Result<Self> {
+        let (channel, commands) = mpsc::channel(1);
+
+        subsys.start(SubsystemBuilder::new("sap", |s| async move {
+            let token = s.create_cancellation_token();
+            let mut actor = SapActor::new(s, commands);
+            actor.run(token).await?;
+            Ok(()) as Aes67Result<()>
+        }));
+
+        Ok(SapApi { channel })
+    }
+
+    pub async fn add_session(&self, sdp: SessionDescription) -> Aes67Result<String> {
+        self.send_function(|tx| SapFunction::AddSession(sdp, tx))
+            .await
+    }
+
+    pub async fn remove_session(&self, sdp: SessionDescription) -> Aes67Result<()> {
+        self.send_function(|tx| SapFunction::RemoveSession(sdp, tx))
+            .await
+    }
+
+    async fn send_function<T>(
+        &self,
+        function: impl FnOnce(oneshot::Sender<Aes67Result<T>>) -> SapFunction,
+    ) -> Aes67Result<T> {
+        actor::send_function::<T, SapFunction, SapError, Aes67Error>(
+            function,
+            &self.channel,
+            SapError::SendError,
+            SapError::ReceiveError,
+        )
+        .await
+    }
+}
+
+#[derive(Debug)]
+pub enum SapFunction {
+    AddSession(SessionDescription, oneshot::Sender<Aes67Result<String>>),
+    RemoveSession(SessionDescription, oneshot::Sender<Aes67Result<()>>),
+}
+
+struct SapActor {
     subsys: SubsystemHandle,
-    mut ui_commands: mpsc::Receiver<UiCommandSAP>,
-) -> Result<()> {
-    let mut sap = Sap::new().await.into_diagnostic()?;
+    sessions: HashMap<String, oneshot::Sender<()>>,
+    commands: mpsc::Receiver<SapFunction>,
+}
 
-    let sdp = SessionDescription::unmarshal(&mut Cursor::new(
-        "v=0
-o=- 3456789 3456789 IN IP4 192.168.178.118
-s=AES VSC
-i=2 channels: Left, Right
-c=IN IP4 239.69.202.125/32
-t=0 0
-a=keywds:Dante
-a=recvonly
-m=audio 5004 RTP/AVP 98
-a=rtpmap:98 L24/48000/2
-a=ptime:1
-a=ts-refclk:ptp=IEEE1588-2008:00-1D-C1-FF-FE-0E-10-C4:0
-a=mediaclk:direct=0
-",
-    ))
-    .into_diagnostic()?;
+impl Actor<SapFunction, SapError> for SapActor {
+    async fn recv_command(&mut self) -> Option<SapFunction> {
+        self.commands.recv().await
+    }
 
-    let announcement = SessionAnnouncement::new(sdp).into_diagnostic()?;
+    async fn process_command(&mut self, command: Option<SapFunction>) -> Result<bool, SapError> {
+        match command {
+            Some(f) => match f {
+                SapFunction::AddSession(sdp, tx) => {
+                    respond(Ok(self.add_session(sdp).await?), tx).await
+                }
+                SapFunction::RemoveSession(sdp, tx) => {
+                    respond(Ok(self.remove_session(sdp).await?), tx).await
+                }
+            },
+            None => Ok(false),
+        }
+    }
+}
 
-    loop {
-        select! {
-            _ = subsys.on_shutdown_requested() => break,
-            _ = sap.announce_session(announcement) => break,
+impl SapActor {
+    fn new(subsys: SubsystemHandle, commands: mpsc::Receiver<SapFunction>) -> Self {
+        let sessions = HashMap::new();
+        SapActor {
+            sessions,
+            subsys,
+            commands,
         }
     }
 
-    sap.delete_session().await.into_diagnostic()?;
+    async fn add_session(&mut self, sdp: SessionDescription) -> Result<String, SapError> {
+        let sap = Sap::new().await?;
+        let session_id = format!("{}/{}", sdp.origin.session_id, sdp.origin.session_version);
+        let session = Self::announce(sap, sdp, &self.subsys, &session_id).await?;
+        self.sessions.insert(session_id.clone(), session);
+        Ok(session_id)
+    }
 
-    subsys.request_shutdown();
+    async fn remove_session(&mut self, sdp: SessionDescription) -> Result<(), SapError> {
+        let session_id = format!("{}/{}", sdp.origin.session_id, sdp.origin.session_version);
+        if let Some(session) = self.sessions.remove(&session_id) {
+            session.send(()).ok();
+        }
 
-    Ok(())
+        Ok(())
+    }
+
+    async fn announce(
+        mut sap: Sap,
+        sdp: SessionDescription,
+        subsys: &SubsystemHandle,
+        session_id: &str,
+    ) -> Result<oneshot::Sender<()>, SapError> {
+        let (tx, mut rx) = oneshot::channel();
+        subsys.start(SubsystemBuilder::new(session_id, move |s| async move {
+            let announcement = SessionAnnouncement::new(sdp)?;
+            select! {
+                _ = s.on_shutdown_requested() => (),
+                _ = sap.announce_session(announcement) => (),
+                _ = &mut rx => (),
+            }
+
+            sap.delete_session().await?;
+
+            Ok(()) as Result<(), SapError>
+        }));
+
+        Ok(tx)
+    }
 }

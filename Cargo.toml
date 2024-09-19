@@ -14,6 +14,7 @@ jemalloc = ["tikv-jemallocator"]
 default = ["jemalloc"]
 
 [dependencies]
+axum = { version = "0.7.5", features = ["http2"] }
 clap = { version = "4.5.17", features = ["derive"] }
 clap-verbosity-flag = "2.2.1"
 dotenv = "0.15.0"
@@ -23,10 +24,16 @@ pnet = "0.35.0"
 rtp-rs = "0.6.0"
 sap-rs = "0.2.5"
 sdp = "0.6.2"
+serde = { version = "1.0.210", features = ["derive"] }
+serde_json = "1.0.128"
 socket2 = "0.5.7"
 statime = "0.2.1"
-tokio = { version = "1.40.0", features = ["net", "rt-multi-thread"] }
+thiserror = "1.0.63"
+tokio = { version = "1.40.0", features = ["full", "net", "rt-multi-thread"] }
 tokio-graceful-shutdown = "0.15.1"
+tokio-util = "0.7.12"
+tower = { version = "0.5.1", features = ["util"] }
+tower-http = { version = "0.5.0", features = ["fs", "trace"] }
 tracing-log = "0.2.0"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
