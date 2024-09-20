@@ -15,24 +15,29 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+use std::future::Future;
 use tokio::{
     select,
-    sync::{
-        mpsc::{self, error::SendError},
-        oneshot::{self, error::RecvError},
-    },
+    sync::{mpsc, oneshot},
 };
 use tokio_util::sync::CancellationToken;
 
-pub trait Actor<C, E> {
-    async fn recv_command(&mut self) -> Option<C>;
-    async fn process_command(&mut self, command: Option<C>) -> Result<bool, E>;
-    async fn run(&mut self, cancel_token: CancellationToken) -> Result<(), E> {
+pub trait Actor {
+    type Message;
+    type Error;
+
+    async fn recv_message(&mut self) -> Option<Self::Message>;
+    async fn process_message(&mut self, msg: Self::Message) -> bool;
+
+    async fn run(&mut self, cancel_token: CancellationToken) -> Result<(), Self::Error> {
         loop {
             select! {
                 _ = cancel_token.cancelled() => break,
-                recv = self.recv_command() => if !self.process_command(recv).await? {
-                    break;
+                recv = self.recv_message() => match recv {
+                    Some(msg) => if !self.process_message(msg).await {
+                        break;
+                    },
+                    None => break,
                 }
             }
         }
@@ -41,23 +46,32 @@ pub trait Actor<C, E> {
     }
 }
 
-pub async fn send_function<T, F, E: Into<E2>, E2>(
-    function: impl FnOnce(oneshot::Sender<Result<T, E2>>) -> F,
-    channel: &mpsc::Sender<F>,
-    send_error_mapper: impl Fn(SendError<F>) -> E,
-    receive_error_mapper: impl Fn(RecvError) -> E,
-) -> Result<T, E2> {
-    let (res_tx, res_rx) = oneshot::channel();
-    let function = function(res_tx);
-    let send_to_aes67_err = |e| send_error_mapper(e);
-    channel
-        .send(function)
-        .await
-        .map_err(|e| send_to_aes67_err(e).into())?;
-    let res = res_rx.await.map_err(|e| receive_error_mapper(e).into())?;
-    res
+pub trait ActorApi {
+    type Message;
+    type Error;
+
+    fn message_tx(&self) -> &mpsc::Sender<Self::Message>;
+
+    async fn send_message<T>(
+        &self,
+        function: impl FnOnce(oneshot::Sender<Result<T, Self::Error>>) -> Self::Message,
+    ) -> Result<T, Self::Error>
+    where
+        Self::Error: From<mpsc::error::SendError<Self::Message>> + From<oneshot::error::RecvError>,
+    {
+        let (res_tx, res_rx) = oneshot::channel();
+        let function = function(res_tx);
+        self.message_tx()
+            .send(function)
+            .await
+            .map_err(|e| Self::Error::from(e))?;
+        res_rx.await.map_err(|e| Self::Error::from(e))?
+    }
 }
 
-pub async fn respond<T, E>(response: T, tx: oneshot::Sender<T>) -> Result<bool, E> {
-    Ok(tx.send(response).is_ok())
+pub async fn respond<T, E>(
+    response: impl Future<Output = Result<T, E>>,
+    tx: oneshot::Sender<Result<T, E>>,
+) -> bool {
+    tx.send(response.await).is_ok()
 }

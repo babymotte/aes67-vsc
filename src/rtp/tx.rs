@@ -16,8 +16,8 @@
  */
 
 use crate::{
-    actor::{self, Actor},
-    error::{Aes67Error, Aes67Result, TxError},
+    actor::{Actor, ActorApi},
+    error::{RxError, TxError},
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
@@ -27,40 +27,39 @@ pub struct RtpTxApi {
     channel: mpsc::Sender<TxFunction>,
 }
 
+impl ActorApi for RtpTxApi {
+    type Message = TxFunction;
+    type Error = TxError;
+
+    fn message_tx(&self) -> &mpsc::Sender<Self::Message> {
+        &self.channel
+    }
+}
+
 impl RtpTxApi {
-    pub fn new(subsys: &SubsystemHandle) -> Aes67Result<Self> {
+    pub fn new(subsys: &SubsystemHandle) -> Result<Self, RxError> {
         let (channel, commands) = mpsc::channel(1);
 
         subsys.start(SubsystemBuilder::new("rtp/tx", |s| async move {
             let mut actor = RtpTxActor::new(commands);
-            actor.run(s.create_cancellation_token()).await?;
-            Ok(()) as Aes67Result<()>
+            actor.run(s.create_cancellation_token()).await
         }));
 
         Ok(RtpTxApi { channel })
     }
 
-    pub async fn create_transmitter(&self, id: TransmitterId, channels: usize) -> Aes67Result<()> {
-        self.send_function(|tx| TxFunction::CreateSender(TxDescriptor { channels, id }, tx))
-            .await
-    }
-
-    pub async fn delete_transmitter(&self, id: TransmitterId) -> Aes67Result<()> {
-        self.send_function(|tx| TxFunction::DeleteSender(id, tx))
-            .await
-    }
-
-    async fn send_function<T>(
+    pub async fn create_transmitter(
         &self,
-        function: impl FnOnce(oneshot::Sender<Aes67Result<T>>) -> TxFunction,
-    ) -> Aes67Result<T> {
-        actor::send_function::<T, TxFunction, TxError, Aes67Error>(
-            function,
-            &self.channel,
-            TxError::SendError,
-            TxError::ReceiveError,
-        )
-        .await
+        id: TransmitterId,
+        channels: usize,
+    ) -> Result<(), TxError> {
+        self.send_message(|tx| TxFunction::CreateSender(TxDescriptor { channels, id }, tx))
+            .await
+    }
+
+    pub async fn delete_transmitter(&self, id: TransmitterId) -> Result<(), TxError> {
+        self.send_message(|tx| TxFunction::DeleteSender(id, tx))
+            .await
     }
 }
 
@@ -74,28 +73,26 @@ pub struct TxDescriptor {
 
 #[derive(Debug)]
 pub enum TxFunction {
-    CreateSender(TxDescriptor, oneshot::Sender<Aes67Result<()>>),
-    DeleteSender(TransmitterId, oneshot::Sender<Aes67Result<()>>),
+    CreateSender(TxDescriptor, oneshot::Sender<Result<(), TxError>>),
+    DeleteSender(TransmitterId, oneshot::Sender<Result<(), TxError>>),
 }
 
 struct RtpTxActor {
     commands: mpsc::Receiver<TxFunction>,
 }
 
-impl Actor<TxFunction, TxError> for RtpTxActor {
-    async fn recv_command(&mut self) -> Option<TxFunction> {
+impl Actor for RtpTxActor {
+    type Message = TxFunction;
+    type Error = TxError;
+
+    async fn recv_message(&mut self) -> Option<TxFunction> {
         self.commands.recv().await
     }
 
-    async fn process_command(&mut self, command: Option<TxFunction>) -> Result<bool, TxError> {
-        match command {
-            Some(f) => {
-                // TODO
-                log::info!("{f:?}");
-                Ok(true)
-            }
-            None => Ok(false),
-        }
+    async fn process_message(&mut self, command: TxFunction) -> bool {
+        // TODO
+        log::info!("{command:?}");
+        true
     }
 }
 

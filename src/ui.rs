@@ -15,8 +15,9 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use crate::actor::{self, respond, Actor};
+use crate::actor::{respond, Actor, ActorApi};
 use aes67_vsc::{
+    error::SapError,
     ptp::PtpApi,
     rtp::{rx::RtpRxApi, tx::RtpTxApi},
     sap::SapApi,
@@ -28,14 +29,30 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use miette::{miette, Error, IntoDiagnostic, Result};
+use miette::{IntoDiagnostic, Result};
 use pnet::{datalink, ipnetwork::IpNetwork};
 use sdp::SessionDescription;
 use serde::{Deserialize, Serialize};
 use std::{env, io::Cursor};
-use tokio::sync::{mpsc, oneshot};
+use thiserror::Error;
+use tokio::sync::{
+    mpsc::{self, error::SendError},
+    oneshot::{self, error::RecvError},
+};
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
 use tower_http::services::{ServeDir, ServeFile};
+
+#[derive(Error, Debug)]
+enum UiError {
+    #[error("channel error: {0}")]
+    SendError(#[from] SendError<UiFunction>),
+    #[error("channel error: {0}")]
+    ReceiveError(#[from] RecvError),
+    #[error("sap error: {0}")]
+    SapError(#[from] SapError),
+    #[error("sdp error: {0}")]
+    SdpError(#[from] sdp::Error),
+}
 
 struct UiActor {
     subsys: SubsystemHandle,
@@ -46,31 +63,27 @@ struct UiActor {
     ui_commands: mpsc::Receiver<UiFunction>,
 }
 
-impl Actor<UiFunction, Error> for UiActor {
-    async fn recv_command(&mut self) -> Option<UiFunction> {
+impl Actor for UiActor {
+    type Message = UiFunction;
+    type Error = UiError;
+
+    async fn recv_message(&mut self) -> Option<UiFunction> {
         self.ui_commands.recv().await
     }
 
-    async fn process_command(
-        &mut self,
-        command: Option<UiFunction>,
-    ) -> std::result::Result<bool, Error> {
+    async fn process_message(&mut self, command: UiFunction) -> bool {
         match command {
-            Some(f) => match f {
-                UiFunction::CreateTransmitter(sdp, tx) => {
-                    respond(self.create_transmitter(sdp).await, tx).await
-                }
-            },
-            None => Ok(false),
+            UiFunction::CreateTransmitter(sdp, tx) => {
+                respond(self.create_transmitter(sdp), tx).await
+            }
         }
     }
 }
 
 impl UiActor {
-    async fn create_transmitter(&self, sdp: String) -> Result<String> {
-        let sd = SessionDescription::unmarshal(&mut Cursor::new(sdp)).into_diagnostic()?;
-        let session_id = self.sap.add_session(sd).await.into_diagnostic()?;
-
+    async fn create_transmitter(&self, sdp: String) -> Result<String, UiError> {
+        let sd = SessionDescription::unmarshal(&mut Cursor::new(sdp))?;
+        let session_id = self.sap.add_session(sd).await?;
         Ok(session_id)
     }
 }
@@ -131,7 +144,7 @@ pub fn ui(
             ui_commands,
         };
 
-        actor.run(cancel_toke).await?;
+        actor.run(cancel_toke).await.into_diagnostic()?;
 
         Ok(()) as Result<()>
     }));
@@ -141,7 +154,7 @@ pub fn ui(
 
 #[derive(Debug)]
 enum UiFunction {
-    CreateTransmitter(String, oneshot::Sender<Result<String>>),
+    CreateTransmitter(String, oneshot::Sender<Result<String, UiError>>),
 }
 
 #[derive(Debug, Clone)]
@@ -149,23 +162,19 @@ struct UiApi {
     channel: mpsc::Sender<UiFunction>,
 }
 
-impl UiApi {
-    async fn create_transmitter(&self, sdp: String) -> Result<String> {
-        self.send_function(|tx| UiFunction::CreateTransmitter(sdp, tx))
-            .await
-    }
+impl ActorApi for UiApi {
+    type Message = UiFunction;
+    type Error = UiError;
 
-    async fn send_function<T>(
-        &self,
-        function: impl FnOnce(oneshot::Sender<Result<T>>) -> UiFunction,
-    ) -> Result<T> {
-        actor::send_function::<T, UiFunction, Error, Error>(
-            function,
-            &self.channel,
-            |e| miette!(e),
-            |e| miette!(e),
-        )
-        .await
+    fn message_tx(&self) -> &mpsc::Sender<Self::Message> {
+        &self.channel
+    }
+}
+
+impl UiApi {
+    async fn create_transmitter(&self, sdp: String) -> Result<String, UiError> {
+        self.send_message(|tx| UiFunction::CreateTransmitter(sdp, tx))
+            .await
     }
 }
 

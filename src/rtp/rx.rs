@@ -16,8 +16,8 @@
  */
 
 use crate::{
-    actor::{self, Actor},
-    error::{Aes67Error, Aes67Result, RxError},
+    actor::{Actor, ActorApi},
+    error::RxError,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
@@ -27,40 +27,35 @@ pub struct RtpRxApi {
     channel: mpsc::Sender<RxFunction>,
 }
 
+impl ActorApi for RtpRxApi {
+    type Message = RxFunction;
+    type Error = RxError;
+
+    fn message_tx(&self) -> &mpsc::Sender<RxFunction> {
+        &self.channel
+    }
+}
+
 impl RtpRxApi {
-    pub fn new(subsys: &SubsystemHandle) -> Aes67Result<Self> {
+    pub fn new(subsys: &SubsystemHandle) -> Result<Self, RxError> {
         let (channel, commands) = mpsc::channel(1);
 
         subsys.start(SubsystemBuilder::new("rtp/rx", |s| async move {
             let mut actor = RtpRxActor::new(commands);
-            actor.run(s.create_cancellation_token()).await?;
-            Ok(()) as Aes67Result<()>
+            actor.run(s.create_cancellation_token()).await
         }));
 
         Ok(RtpRxApi { channel })
     }
 
-    pub async fn create_receiver(&self, id: ReceiverId, channels: usize) -> Aes67Result<()> {
-        self.send_function(|tx| RxFunction::CreateReceiver(RxDescriptor { channels, id }, tx))
+    pub async fn create_receiver(&self, id: ReceiverId, channels: usize) -> Result<(), RxError> {
+        self.send_message(|tx| RxFunction::CreateReceiver(RxDescriptor { channels, id }, tx))
             .await
     }
 
-    pub async fn delete_receiver(&self, id: ReceiverId) -> Aes67Result<()> {
-        self.send_function(|tx| RxFunction::DeleteReceiver(id, tx))
+    pub async fn delete_receiver(&self, id: ReceiverId) -> Result<(), RxError> {
+        self.send_message(|tx| RxFunction::DeleteReceiver(id, tx))
             .await
-    }
-
-    async fn send_function<T>(
-        &self,
-        function: impl FnOnce(oneshot::Sender<Aes67Result<T>>) -> RxFunction,
-    ) -> Aes67Result<T> {
-        actor::send_function::<T, RxFunction, RxError, Aes67Error>(
-            function,
-            &self.channel,
-            RxError::SendError,
-            RxError::ReceiveError,
-        )
-        .await
     }
 }
 
@@ -74,28 +69,26 @@ pub struct RxDescriptor {
 
 #[derive(Debug)]
 pub enum RxFunction {
-    CreateReceiver(RxDescriptor, oneshot::Sender<Aes67Result<()>>),
-    DeleteReceiver(ReceiverId, oneshot::Sender<Aes67Result<()>>),
+    CreateReceiver(RxDescriptor, oneshot::Sender<Result<(), RxError>>),
+    DeleteReceiver(ReceiverId, oneshot::Sender<Result<(), RxError>>),
 }
 
 struct RtpRxActor {
     commands: mpsc::Receiver<RxFunction>,
 }
 
-impl Actor<RxFunction, RxError> for RtpRxActor {
-    async fn recv_command(&mut self) -> Option<RxFunction> {
+impl Actor for RtpRxActor {
+    type Message = RxFunction;
+    type Error = RxError;
+
+    async fn recv_message(&mut self) -> Option<RxFunction> {
         self.commands.recv().await
     }
 
-    async fn process_command(&mut self, command: Option<RxFunction>) -> Result<bool, RxError> {
-        match command {
-            Some(f) => {
-                // TODO
-                log::info!("{f:?}");
-                Ok(true)
-            }
-            None => Ok(false),
-        }
+    async fn process_message(&mut self, command: RxFunction) -> bool {
+        // TODO
+        log::info!("{command:?}");
+        true
     }
 }
 

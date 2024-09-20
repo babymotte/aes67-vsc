@@ -16,8 +16,8 @@
  */
 
 use crate::{
-    actor::{self, respond, Actor},
-    error::{Aes67Error, Aes67Result, SapError},
+    actor::{respond, Actor, ActorApi},
+    error::SapError,
 };
 use sap_rs::{Sap, SessionAnnouncement};
 use sdp::SessionDescription;
@@ -32,83 +32,77 @@ pub struct SapApi {
     channel: mpsc::Sender<SapFunction>,
 }
 
+impl ActorApi for SapApi {
+    type Message = SapFunction;
+    type Error = SapError;
+
+    fn message_tx(&self) -> &mpsc::Sender<SapFunction> {
+        &self.channel
+    }
+}
+
 impl SapApi {
-    pub fn new(subsys: &SubsystemHandle) -> Aes67Result<Self> {
-        let (channel, commands) = mpsc::channel(1);
+    pub fn new(subsys: &SubsystemHandle) -> Result<Self, SapError> {
+        let (channel, messages) = mpsc::channel(1);
 
         subsys.start(SubsystemBuilder::new("sap", |s| async move {
             let token = s.create_cancellation_token();
-            let mut actor = SapActor::new(s, commands);
-            actor.run(token).await?;
-            Ok(()) as Aes67Result<()>
+            let mut actor = SapActor::new(s, messages);
+            actor.run(token).await
         }));
 
         Ok(SapApi { channel })
     }
 
-    pub async fn add_session(&self, sdp: SessionDescription) -> Aes67Result<String> {
-        self.send_function(|tx| SapFunction::AddSession(sdp, tx))
+    pub async fn add_session(&self, sdp: SessionDescription) -> Result<String, SapError> {
+        self.send_message(|tx| SapFunction::AddSession(sdp, tx))
             .await
     }
 
-    pub async fn remove_session(&self, sdp: SessionDescription) -> Aes67Result<()> {
-        self.send_function(|tx| SapFunction::RemoveSession(sdp, tx))
+    pub async fn remove_session(&self, sdp: SessionDescription) -> Result<(), SapError> {
+        self.send_message(|tx| SapFunction::RemoveSession(sdp, tx))
             .await
-    }
-
-    async fn send_function<T>(
-        &self,
-        function: impl FnOnce(oneshot::Sender<Aes67Result<T>>) -> SapFunction,
-    ) -> Aes67Result<T> {
-        actor::send_function::<T, SapFunction, SapError, Aes67Error>(
-            function,
-            &self.channel,
-            SapError::SendError,
-            SapError::ReceiveError,
-        )
-        .await
     }
 }
 
 #[derive(Debug)]
 pub enum SapFunction {
-    AddSession(SessionDescription, oneshot::Sender<Aes67Result<String>>),
-    RemoveSession(SessionDescription, oneshot::Sender<Aes67Result<()>>),
+    AddSession(
+        SessionDescription,
+        oneshot::Sender<Result<String, SapError>>,
+    ),
+    RemoveSession(SessionDescription, oneshot::Sender<Result<(), SapError>>),
 }
 
 struct SapActor {
     subsys: SubsystemHandle,
     sessions: HashMap<String, oneshot::Sender<()>>,
-    commands: mpsc::Receiver<SapFunction>,
+    messages: mpsc::Receiver<SapFunction>,
 }
 
-impl Actor<SapFunction, SapError> for SapActor {
-    async fn recv_command(&mut self) -> Option<SapFunction> {
-        self.commands.recv().await
+impl Actor for SapActor {
+    type Message = SapFunction;
+    type Error = SapError;
+
+    async fn recv_message(&mut self) -> Option<SapFunction> {
+        self.messages.recv().await
     }
 
-    async fn process_command(&mut self, command: Option<SapFunction>) -> Result<bool, SapError> {
-        match command {
-            Some(f) => match f {
-                SapFunction::AddSession(sdp, tx) => {
-                    respond(Ok(self.add_session(sdp).await?), tx).await
-                }
-                SapFunction::RemoveSession(sdp, tx) => {
-                    respond(Ok(self.remove_session(sdp).await?), tx).await
-                }
-            },
-            None => Ok(false),
+    async fn process_message(&mut self, msg: SapFunction) -> bool {
+        match msg {
+            SapFunction::AddSession(sdp, tx) => respond(self.add_session(sdp), tx).await,
+            SapFunction::RemoveSession(sdp, tx) => respond(self.remove_session(sdp), tx).await,
         }
     }
 }
 
 impl SapActor {
-    fn new(subsys: SubsystemHandle, commands: mpsc::Receiver<SapFunction>) -> Self {
+    fn new(subsys: SubsystemHandle, messages: mpsc::Receiver<SapFunction>) -> Self {
         let sessions = HashMap::new();
         SapActor {
             sessions,
             subsys,
-            commands,
+            messages,
         }
     }
 

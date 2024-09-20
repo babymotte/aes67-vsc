@@ -16,8 +16,8 @@
  */
 
 use crate::{
-    actor::{self, respond, Actor},
-    error::{Aes67Error, Aes67Result, PtpError},
+    actor::{respond, Actor, ActorApi},
+    error::PtpError,
 };
 use miette::Result;
 use tokio::sync::{mpsc, oneshot};
@@ -27,58 +27,52 @@ pub struct PtpApi {
     channel: mpsc::Sender<PtpFunction>,
 }
 
+impl ActorApi for PtpApi {
+    type Message = PtpFunction;
+    type Error = PtpError;
+
+    fn message_tx(&self) -> &mpsc::Sender<PtpFunction> {
+        &self.channel
+    }
+}
+
 impl PtpApi {
-    pub fn new(subsys: &SubsystemHandle) -> Aes67Result<Self> {
+    pub fn new(subsys: &SubsystemHandle) -> Result<Self, PtpError> {
         let (channel, commands) = mpsc::channel(1);
 
         subsys.start(SubsystemBuilder::new("ptp", |s| async move {
             let mut actor = PtpActor::new(commands);
-            actor.run(s.create_cancellation_token()).await?;
-            Ok(()) as Aes67Result<()>
+            actor.run(s.create_cancellation_token()).await
         }));
 
         Ok(PtpApi { channel })
     }
 
-    pub async fn set_prio(&self, prio: u16) -> Aes67Result<()> {
-        self.send_function(|tx| PtpFunction::SetPrio(prio, tx))
-            .await
-    }
-
-    async fn send_function<T>(
-        &self,
-        function: impl FnOnce(oneshot::Sender<Aes67Result<T>>) -> PtpFunction,
-    ) -> Aes67Result<T> {
-        actor::send_function::<T, PtpFunction, PtpError, Aes67Error>(
-            function,
-            &self.channel,
-            PtpError::SendError,
-            PtpError::ReceiveError,
-        )
-        .await
+    pub async fn set_prio(&self, prio: u16) -> Result<(), PtpError> {
+        self.send_message(|tx| PtpFunction::SetPrio(prio, tx)).await
     }
 }
 
 #[derive(Debug)]
 pub enum PtpFunction {
-    SetPrio(u16, oneshot::Sender<Aes67Result<()>>),
+    SetPrio(u16, oneshot::Sender<Result<(), PtpError>>),
 }
 
 struct PtpActor {
     commands: mpsc::Receiver<PtpFunction>,
 }
 
-impl Actor<PtpFunction, PtpError> for PtpActor {
-    async fn recv_command(&mut self) -> Option<PtpFunction> {
+impl Actor for PtpActor {
+    type Message = PtpFunction;
+    type Error = PtpError;
+
+    async fn recv_message(&mut self) -> Option<PtpFunction> {
         self.commands.recv().await
     }
 
-    async fn process_command(&mut self, command: Option<PtpFunction>) -> Result<bool, PtpError> {
+    async fn process_message(&mut self, command: PtpFunction) -> bool {
         match command {
-            Some(f) => match f {
-                PtpFunction::SetPrio(prio, tx) => respond(Ok(self.set_prio(prio).await?), tx).await,
-            },
-            None => Ok(false),
+            PtpFunction::SetPrio(prio, tx) => respond(self.set_prio(prio), tx).await,
         }
     }
 }
