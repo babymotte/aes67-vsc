@@ -17,7 +17,7 @@
 
 use crate::actor::{respond, Actor, ActorApi};
 use aes67_vsc::{
-    error::SapError,
+    error::{RxError, SapError},
     ptp::PtpApi,
     rtp::{rx::RtpRxApi, tx::RtpTxApi},
     sap::SapApi,
@@ -33,7 +33,7 @@ use miette::{IntoDiagnostic, Result};
 use pnet::{datalink, ipnetwork::IpNetwork};
 use sdp::SessionDescription;
 use serde::{Deserialize, Serialize};
-use std::{env, io::Cursor};
+use std::{env, io::Cursor, sync::mpsc::Receiver};
 use thiserror::Error;
 use tokio::sync::{
     mpsc::{self, error::SendError},
@@ -52,6 +52,8 @@ enum UiError {
     SapError(#[from] SapError),
     #[error("sdp error: {0}")]
     SdpError(#[from] sdp::Error),
+    #[error("receiver error: {0}")]
+    RxError(#[from] RxError),
 }
 
 struct UiActor {
@@ -76,6 +78,10 @@ impl Actor for UiActor {
             UiFunction::CreateTransmitter(sdp, tx) => {
                 respond(self.create_transmitter(sdp), tx).await
             }
+            UiFunction::ReceiveStream(sdp, tx) => respond(self.receive_stream(sdp), tx).await,
+            UiFunction::DeleteReceiver(receiver, tx) => {
+                respond(self.delete_receiver(receiver), tx).await
+            }
         }
     }
 }
@@ -85,6 +91,17 @@ impl UiActor {
         let sd = SessionDescription::unmarshal(&mut Cursor::new(sdp))?;
         let session_id = self.sap.add_session(sd).await?;
         Ok(session_id)
+    }
+
+    async fn receive_stream(&self, sdp: String) -> Result<(), UiError> {
+        let sd = SessionDescription::unmarshal(&mut Cursor::new(sdp))?;
+        self.rtp_rx.create_receiver(sd).await?;
+        Ok(())
+    }
+
+    async fn delete_receiver(&self, receiver: usize) -> Result<(), UiError> {
+        self.rtp_rx.delete_receiver(receiver).await?;
+        Ok(())
     }
 }
 
@@ -117,6 +134,8 @@ pub fn ui(
 
             let app = Router::new()
                 .route("/api/v1/create/transmitter", post(create_transmitter))
+                .route("/api/v1/receive/stream", post(receive_stream))
+                .route("/api/v1/delete/receiver", post(delete_receiver))
                 .route("/api/v1/wb/config", get(wb_config))
                 .nest_service("/", serve_dir.clone())
                 .fallback_service(serve_dir)
@@ -155,6 +174,8 @@ pub fn ui(
 #[derive(Debug)]
 enum UiFunction {
     CreateTransmitter(String, oneshot::Sender<Result<String, UiError>>),
+    ReceiveStream(String, oneshot::Sender<Result<(), UiError>>),
+    DeleteReceiver(usize, oneshot::Sender<Result<(), UiError>>),
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +195,16 @@ impl ActorApi for UiApi {
 impl UiApi {
     async fn create_transmitter(&self, sdp: String) -> Result<String, UiError> {
         self.send_message(|tx| UiFunction::CreateTransmitter(sdp, tx))
+            .await
+    }
+
+    async fn receive_stream(&self, sdp: String) -> Result<(), UiError> {
+        self.send_message(|tx| UiFunction::ReceiveStream(sdp, tx))
+            .await
+    }
+
+    async fn delete_receiver(&self, receiver: usize) -> Result<(), UiError> {
+        self.send_message(|tx| UiFunction::DeleteReceiver(receiver, tx))
             .await
     }
 }
@@ -204,6 +235,52 @@ async fn create_transmitter(
     )
 }
 
+async fn receive_stream(
+    State(ui_api): State<UiApi>,
+    Json(payload): Json<ReceiveStream>,
+) -> impl IntoResponse {
+    if let Err(e) = ui_api.receive_stream(payload.sdp).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ReceivingStream {
+                result: None,
+                error: Some(e.to_string()),
+            }),
+        );
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(ReceivingStream {
+            result: Some("OK".to_owned()),
+            error: None,
+        }),
+    )
+}
+
+async fn delete_receiver(
+    State(ui_api): State<UiApi>,
+    Json(payload): Json<DeleteReceiver>,
+) -> impl IntoResponse {
+    if let Err(e) = ui_api.delete_receiver(payload.receiver).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ReceiverDeleted {
+                result: None,
+                error: Some(e.to_string()),
+            }),
+        );
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(ReceiverDeleted {
+            result: Some("OK".to_owned()),
+            error: None,
+        }),
+    )
+}
+
 async fn wb_config() -> impl IntoResponse {
     // TODO load from config
     Json(WorterbuchConfig {
@@ -220,10 +297,34 @@ struct CreateTransmitter {
     sdp: String,
 }
 
+#[derive(Deserialize)]
+struct ReceiveStream {
+    sdp: String,
+}
+
+#[derive(Deserialize)]
+struct DeleteReceiver {
+    receiver: usize,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TransmitterCreated {
     session_id: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReceivingStream {
+    result: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReceiverDeleted {
+    result: Option<String>,
     error: Option<String>,
 }
 

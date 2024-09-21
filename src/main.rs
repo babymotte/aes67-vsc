@@ -45,6 +45,12 @@ struct Args {
     /// The port to run the web UI on
     #[arg(short, long)]
     port: Option<u16>,
+    /// Number of input channels
+    #[arg(short, long, default_value = "32")]
+    inputs: usize,
+    /// Number of output channels
+    #[arg(short, long, default_value = "32")]
+    outputs: usize,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -73,7 +79,7 @@ async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
     let port = args.port.unwrap_or(9090);
 
     let rtp_tx = RtpTxApi::new(&subsys).into_diagnostic()?;
-    let rtp_rx = RtpRxApi::new(&subsys).into_diagnostic()?;
+    let rtp_rx = RtpRxApi::new(&subsys, args.inputs).into_diagnostic()?;
     let sap = SapApi::new(&subsys).into_diagnostic()?;
     let ptp = PtpApi::new(&subsys).into_diagnostic()?;
 

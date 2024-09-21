@@ -19,7 +19,7 @@ use std::io;
 
 use crate::{
     ptp::PtpFunction,
-    rtp::{rx::RxFunction, tx::TxFunction},
+    rtp::{rx::RxFunction, tx::TxFunction, ReceiverId, RxThreadFunction},
     sap::SapFunction,
 };
 use thiserror::Error;
@@ -37,6 +37,8 @@ pub enum Aes67Error {
     PtpError(#[from] PtpError),
 }
 
+pub type Aes67Result<T> = Result<T, Aes67Error>;
+
 #[derive(Error, Debug)]
 pub enum TxError {
     #[error("io error: {0}")]
@@ -47,6 +49,8 @@ pub enum TxError {
     ReceiveError(#[from] RecvError),
 }
 
+pub type TxResult<T> = Result<T, TxError>;
+
 #[derive(Error, Debug)]
 pub enum RxError {
     #[error("io error: {0}")]
@@ -55,7 +59,17 @@ pub enum RxError {
     SendError(#[from] SendError<RxFunction>),
     #[error("channel error: {0}")]
     ReceiveError(#[from] RecvError),
+    #[error("channel error: {0}")]
+    ThreadSendError(#[from] SendError<RxThreadFunction>),
+    #[error("invalid sdp: {0}")]
+    InvalidSdp(String),
+    #[error("invalid receiver id: {0}")]
+    InvalidReceiverId(ReceiverId),
+    #[error("max channels exceeded: {0}")]
+    MaxChannelsExceeded(usize),
 }
+
+pub type RxResult<T> = Result<T, RxError>;
 
 #[derive(Error, Debug)]
 pub enum SapError {
@@ -66,6 +80,7 @@ pub enum SapError {
     #[error("channel error: {0}")]
     ReceiveError(#[from] RecvError),
 }
+pub type SapResult<T> = Result<T, SapError>;
 
 #[derive(Error, Debug)]
 pub enum PtpError {
@@ -77,4 +92,4 @@ pub enum PtpError {
     ReceiveError(#[from] RecvError),
 }
 
-pub type Aes67Result<T> = Result<T, Aes67Error>;
+pub type PtpResult<T> = Result<T, PtpError>;

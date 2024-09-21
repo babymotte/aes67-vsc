@@ -56,6 +56,7 @@ impl PtpApi {
 #[derive(Debug)]
 pub enum PtpFunction {
     SetPrio(u16, oneshot::Sender<Result<(), PtpError>>),
+    StartClock(oneshot::Sender<Result<(), PtpError>>),
 }
 
 struct PtpActor {
@@ -73,6 +74,7 @@ impl Actor for PtpActor {
     async fn process_message(&mut self, command: PtpFunction) -> bool {
         match command {
             PtpFunction::SetPrio(prio, tx) => respond(self.set_prio(prio), tx).await,
+            PtpFunction::StartClock(tx) => respond(self.start_clock(), tx).await,
         }
     }
 }
@@ -83,6 +85,11 @@ impl PtpActor {
     }
 
     async fn set_prio(&mut self, _prio: u16) -> Result<(), PtpError> {
+        // TODO
+        Ok(())
+    }
+
+    async fn start_clock(&mut self) -> Result<(), PtpError> {
         // TODO
         Ok(())
     }
