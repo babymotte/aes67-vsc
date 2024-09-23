@@ -32,7 +32,7 @@ POST http://localhost:9090/api/v1/receive/stream  HTTP/2.0
 Content-Type: application/json
 
 {
-    "sdp": "v=0\no=- 3456784 3456789 IN IP4 192.168.178.118\ns=AES VSC\ni=2 channels: Left, Right\nc=IN IP4 239.69.202.125/32\nt=0 0\na=keywds:Dante\na=recvonly\nm=audio 5004 RTP/AVP 98\na=rtpmap:98 L24/48000/2\na=ptime:1\na=ts-refclk:ptp=IEEE1588-2008:00-1D-C1-FF-FE-0E-10-C4:0\na=mediaclk:direct=0\n"
+    "sdp": "v=0\r\no=- 442722 442722 IN IP4 192.168.178.97\r\ns=AVIO-Bluetooth : 2\r\nc=IN IP4 239.69.35.56/32\r\nt=0 0\r\na=keywds:Dante\r\nm=audio 5004 RTP/AVP 97\r\ni=2 channels: Left, Right\r\na=recvonly\r\na=rtpmap:97 L24/48000/2\r\na=ptime:1\r\na=ts-refclk:ptp=IEEE1588-2008:00-1D-C1-FF-FE-0E-10-C4:0\r\na=mediaclk:direct=586769660\r\n"
 }
 
 ###

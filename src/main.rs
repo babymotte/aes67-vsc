@@ -43,14 +43,17 @@ struct Args {
     #[command(flatten)]
     verbose: clap_verbosity_flag::Verbosity,
     /// The port to run the web UI on
-    #[arg(short, long)]
-    port: Option<u16>,
+    #[arg(short, long, default_value = "9090")]
+    port: u16,
     /// Number of input channels
     #[arg(short, long, default_value = "32")]
     inputs: usize,
     /// Number of output channels
     #[arg(short, long, default_value = "32")]
     outputs: usize,
+    /// Max link offset it packets
+    #[arg(short, long, default_value = "20")]
+    link_offset: usize,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -76,10 +79,12 @@ async fn main() -> Result<()> {
 }
 
 async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
-    let port = args.port.unwrap_or(9090);
+    let port = args.port;
+    let max_link_offset_multiplier = args.link_offset;
 
     let rtp_tx = RtpTxApi::new(&subsys).into_diagnostic()?;
-    let rtp_rx = RtpRxApi::new(&subsys, args.inputs).into_diagnostic()?;
+    let rtp_rx =
+        RtpRxApi::new(&subsys, args.inputs, max_link_offset_multiplier).into_diagnostic()?;
     let sap = SapApi::new(&subsys).into_diagnostic()?;
     let ptp = PtpApi::new(&subsys).into_diagnostic()?;
 
