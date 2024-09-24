@@ -18,27 +18,31 @@
 use crate::{
     actor::{respond, Actor, ActorApi},
     error::{RxError, RxResult},
-    utils::session_id,
+    utils::{session_id, RtpIter},
 };
+use core::f32;
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    BufferSize, SampleRate, Stream, StreamConfig,
+    BufferSize, HostId, SampleRate, Stream, StreamConfig,
 };
-use rtp_rs::RtpReader;
+use rtp_rs::{RtpReader, Seq};
 use sdp::{
     description::common::{Address, ConnectionInformation},
     SessionDescription,
 };
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::{
+    backtrace,
+    cell::Cell,
     collections::HashMap,
-    io,
+    iter,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     thread,
+    time::Instant,
 };
 use tokio::{
     net::UdpSocket,
-    runtime, select,
+    runtime, select, spawn,
     sync::{
         mpsc::{self},
         oneshot,
@@ -50,28 +54,17 @@ use tokio_util::sync::CancellationToken;
 pub(crate) type ReceiverId = usize;
 
 #[derive(Debug, Clone)]
-struct RxDescriptor {
-    id: usize,
-    bit_depth: usize,
-    channels: usize,
-    sampling_rate: usize,
-    packet_time: f32,
-    packet_len: usize,
-    max_link_offset: usize,
-    link_offset: usize,
+pub struct RxDescriptor {
+    pub id: usize,
+    pub bit_depth: usize,
+    pub channels: usize,
+    pub sampling_rate: usize,
+    pub packet_time: f32,
+    pub link_offset: f32,
 }
 
 impl RxDescriptor {
-    fn new(
-        receiver_id: usize,
-        sd: &SessionDescription,
-        max_link_offset: usize,
-        link_offset: usize,
-    ) -> Result<Self, RxError> {
-        if link_offset > max_link_offset {
-            return Err(RxError::InvalidLinkOffset(link_offset, max_link_offset));
-        }
-
+    fn new(receiver_id: usize, sd: &SessionDescription, link_offset: f32) -> Result<Self, RxError> {
         let media = if let Some(it) = sd.media_descriptions.iter().next() {
             it
         } else {
@@ -123,33 +116,58 @@ impl RxDescriptor {
             return Err(RxError::InvalidSdp("no ptime".to_owned()));
         };
 
-        let rtp_header_len = 12;
-        let samples_per_frame =
-            f32::ceil((channels * sampling_rate) as f32 * packet_time / 1000.0) as usize;
-        let packet_len = rtp_header_len + samples_per_frame;
-
         Ok(RxDescriptor {
             id: receiver_id,
             bit_depth,
             channels,
             sampling_rate,
             packet_time,
-            max_link_offset,
-            packet_len,
             link_offset,
         })
     }
 
-    pub fn set_link_offset(&mut self, link_offset: usize) -> RxResult<()> {
-        if link_offset > self.max_link_offset {
-            return Err(RxError::InvalidLinkOffset(
-                link_offset,
-                self.max_link_offset,
-            ));
-        } else {
-            self.link_offset = link_offset;
-        }
-        Ok(())
+    pub fn rtp_header_len(&self) -> usize {
+        12
+    }
+
+    pub fn bytes_per_sample(&self) -> usize {
+        self.bit_depth / 8
+    }
+
+    pub fn bytes_per_frame(&self) -> usize {
+        self.channels * self.bytes_per_sample()
+    }
+
+    pub fn frames_per_packet(&self) -> usize {
+        f32::ceil(self.sampling_rate as f32 * self.packet_time / 1000.0) as usize
+    }
+
+    pub fn samples_per_packet(&self) -> usize {
+        self.channels * self.frames_per_packet()
+    }
+
+    pub fn packets_in_link_offset(&self) -> f32 {
+        self.link_offset / self.packet_time
+    }
+
+    pub fn frames_per_link_offset_buffer(&self) -> usize {
+        f32::ceil(self.packets_in_link_offset() * self.frames_per_packet() as f32) as usize
+    }
+
+    pub fn rtp_payload_size(&self) -> usize {
+        self.frames_per_packet() * self.bytes_per_frame()
+    }
+
+    pub fn rtp_packet_size(&self) -> usize {
+        self.rtp_header_len() + self.rtp_payload_size()
+    }
+
+    pub fn audio_buffer_size(&self) -> usize {
+        self.channels * self.frames_per_link_offset_buffer()
+    }
+
+    pub fn rtp_buffer_size(&self) -> usize {
+        f32::ceil(self.packets_in_link_offset() * self.rtp_packet_size() as f32) as usize
     }
 }
 
@@ -170,17 +188,8 @@ enum RxThreadEvent {
 
 #[derive(Debug)]
 pub enum RxThreadFunction {
-    StartReceiver(
-        ReceiverId,
-        RxDescriptor,
-        UdpSocket,
-        Box<[u8]>,
-        mpsc::Sender<RxConfig>,
-        mpsc::Receiver<RxConfig>,
-        Response<()>,
-    ),
+    StartReceiver(ReceiverId, RxDescriptor, UdpSocket, Response<()>),
     StopReceiver(ReceiverId, Response<()>),
-    ConfigReceiver(ReceiverId, RxConfig, Response<()>),
 }
 
 struct RxThreadDestructor {
@@ -211,7 +220,7 @@ impl RtpRxApi {
     pub fn new(
         subsys: &SubsystemHandle,
         max_channels: usize,
-        max_link_offset_multiplier: usize,
+        link_offset: f32,
     ) -> Result<Self, RxError> {
         let (channel, commands) = mpsc::channel(1);
 
@@ -236,7 +245,7 @@ impl RtpRxApi {
                 rx_thread_function_tx,
                 rx_thread_event_rx,
                 max_channels,
-                max_link_offset_multiplier,
+                link_offset,
             );
             let res = actor.run(s.create_cancellation_token()).await;
             stop_tx.send(()).ok();
@@ -265,7 +274,6 @@ type Response<T> = oneshot::Sender<RxResult<T>>;
 pub enum RxFunction {
     CreateReceiver(SessionDescription, Response<()>),
     DeleteReceiver(ReceiverId, Response<()>),
-    RxConfig(ReceiverId, RxConfig, Response<()>),
 }
 
 #[derive(Debug)]
@@ -281,7 +289,7 @@ struct RtpRxActor {
     rx_thread_event_rx: mpsc::UnboundedReceiver<RxThreadEvent>,
     max_channels: usize,
     used_channels: usize,
-    max_link_offset: usize,
+    link_offset: f32,
 }
 
 impl Actor for RtpRxActor {
@@ -296,7 +304,6 @@ impl Actor for RtpRxActor {
         match command {
             RxFunction::CreateReceiver(sdp, tx) => respond(self.create_receiver(sdp), tx).await,
             RxFunction::DeleteReceiver(id, tx) => respond(self.delete_receiver(id), tx).await,
-            RxFunction::RxConfig(id, cfg, tx) => respond(self.config_receiver(id, cfg), tx).await,
         }
     }
 
@@ -324,7 +331,7 @@ impl RtpRxActor {
         rx_thread_function_tx: mpsc::Sender<RxThreadFunction>,
         rx_thread_event_rx: mpsc::UnboundedReceiver<RxThreadEvent>,
         max_channels: usize,
-        max_link_offset: usize,
+        link_offset: f32,
     ) -> Self {
         let receiver_ids = HashMap::new();
         let active_receivers = vec![None; max_channels];
@@ -336,7 +343,7 @@ impl RtpRxActor {
             rx_thread_event_rx,
             max_channels,
             used_channels: 0,
-            max_link_offset,
+            link_offset,
         }
     }
 
@@ -374,30 +381,18 @@ impl RtpRxActor {
                 return Err(RxError::MaxChannelsExceeded(self.max_channels));
             }
         };
-        let desc = RxDescriptor::new(
-            receiver_id,
-            &sdp,
-            self.max_link_offset,
-            self.max_link_offset,
-        )?;
+        let desc = RxDescriptor::new(receiver_id, &sdp, self.link_offset)?;
         if self.used_channels + desc.channels > self.max_channels {
             return Err(RxError::MaxChannelsExceeded(self.max_channels));
         }
         log::info!("Creating receiver '{receiver_id}' for session '{session_id}' …",);
         let socket = create_rx_socket(&sdp).await?;
         let (tx, rx) = oneshot::channel();
-        let max_link_offset_multiplier = desc.max_link_offset as f32 / desc.packet_time;
-        let buffer_size = f32::ceil(desc.packet_len as f32 * max_link_offset_multiplier) as usize;
-        let buffer = init_buffer(buffer_size, || 0u8);
-        let (rx_config_tx, rx_config_rx) = mpsc::channel(10);
         self.rx_thread_function_tx
             .send(RxThreadFunction::StartReceiver(
                 receiver_id,
                 desc.clone(),
                 socket,
-                buffer,
-                rx_config_tx,
-                rx_config_rx,
                 tx,
             ))
             .await?;
@@ -444,15 +439,6 @@ impl RtpRxActor {
             log::warn!("Receiver '{receiver_id}' does not exist.");
         }
 
-        Ok(())
-    }
-
-    async fn config_receiver(&self, receiver_id: usize, cfg: RxConfig) -> RxResult<()> {
-        let (tx, rx) = oneshot::channel();
-        self.rx_thread_function_tx
-            .send(RxThreadFunction::ConfigReceiver(receiver_id, cfg, tx))
-            .await?;
-        rx.await??;
         Ok(())
     }
 }
@@ -639,7 +625,6 @@ struct RxEventLoop {
     max_packet_len: usize,
     max_rtp_overhead: usize,
     playout_streams: Box<[Option<CpalStream>]>,
-    rx_config_txs: Box<[Option<mpsc::Sender<RxConfig>>]>,
     rx_descriptors: Box<[Option<RxDescriptor>]>,
     event_tx: mpsc::UnboundedSender<RxThreadEvent>,
 }
@@ -665,10 +650,8 @@ impl RxEventLoop {
 
         let playout_streams = init_buffer(max_channels, || None);
         let rx_descriptors = init_buffer(max_channels, || None);
-        let rx_config_txs = init_buffer(max_channels, || None);
 
         RxEventLoop {
-            rx_config_txs,
             playout_streams,
             max_bit_depth,
             max_samples_per_frame,
@@ -689,16 +672,12 @@ impl RxEventLoop {
                 _ = &mut stop_rx => break,
                 Some(fun) = fun_rx.recv() =>  {
                     match fun {
-                        RxThreadFunction::StartReceiver(index, desc,socket, buffer, rx_config_tx, rx_config_rx, tx) => {
-                            self.start_receiver(index, desc, socket, buffer, rx_config_tx, rx_config_rx, tx);
+                        RxThreadFunction::StartReceiver(index, desc,socket, tx) => {
+                            self.start_receiver(index, desc, socket, tx);
                         },
                         RxThreadFunction::StopReceiver(index, tx) => {
                             self.stop_receiver(index, tx);
                         },
-                        RxThreadFunction::ConfigReceiver(index, cfg, tx) => {
-                            self.config_receiver(index, cfg, tx);
-                        },
-
                     }
                 },
                 else => break,
@@ -712,14 +691,10 @@ impl RxEventLoop {
         index: usize,
         desc: RxDescriptor,
         socket: UdpSocket,
-        buffer: Box<[u8]>,
-        rx_config_tx: mpsc::Sender<RxConfig>,
-        rx_config_rx: mpsc::Receiver<RxConfig>,
         tx: Response<()>,
     ) {
         self.rx_descriptors[index] = Some(desc.clone());
-        self.rx_config_txs[index] = Some(rx_config_tx);
-        if let Err(e) = self.playout_stream(index, socket, desc, buffer, rx_config_rx) {
+        if let Err(e) = self.playout_stream(index, socket, desc) {
             log::error!("Error playing out receiver stream: {e}");
             tx.send(Err(e)).ok();
         } else {
@@ -729,17 +704,8 @@ impl RxEventLoop {
 
     fn stop_receiver(&mut self, index: usize, tx: Response<()>) {
         drop(self.rx_descriptors[index].take());
-        drop(self.rx_config_txs[index].take());
         drop(self.playout_streams[index].take());
         tx.send(Ok(())).ok();
-    }
-
-    async fn config_receiver(&mut self, index: usize, cfg: RxConfig, tx: Response<()>) {
-        if let Some(cfg_tx) = &self.rx_config_txs[index] {
-            tx.send(cfg_tx.send(cfg).await.map_err(RxError::from)).ok();
-        } else {
-            tx.send(Err(RxError::InvalidReceiverId(index))).ok();
-        }
     }
 
     fn playout_stream(
@@ -747,10 +713,12 @@ impl RxEventLoop {
         receiver_id: usize,
         socket: UdpSocket,
         desc: RxDescriptor,
-        mut buffer: Box<[u8]>,
-        mut cfg_rx: mpsc::Receiver<RxConfig>,
     ) -> RxResult<()> {
-        let host = cpal::default_host();
+        let host = cpal::host_from_id(HostId::Jack).unwrap_or_else(|_| cpal::default_host());
+        // let host = cpal::default_host();
+
+        log::info!("Host: {:?}", host.id());
+
         let device = if let Some(it) = host.default_output_device() {
             log::info!("Output device: {:?}", it.name());
             it
@@ -759,49 +727,70 @@ impl RxEventLoop {
             return Err(RxError::NoPlayoutDevice("default".to_owned()));
         };
 
-        let buffer_frame_count =
-            f32::ceil((desc.sampling_rate as f32 * desc.packet_time) / 1000.0) as u32;
+        log::info!("{:?}", device.default_output_config());
 
         let config = StreamConfig {
             channels: desc.channels as u16,
             sample_rate: SampleRate(desc.sampling_rate as u32),
-            buffer_size: BufferSize::Fixed(buffer_frame_count),
+            buffer_size: BufferSize::Fixed(desc.frames_per_link_offset_buffer() as u32),
         };
 
         log::debug!("stream config: {config:?}");
 
-        let bytes_per_sample = desc.bit_depth / 8;
+        let (sample_tx, mut sample_rx) = mpsc::channel(2 * desc.rtp_buffer_size());
+
+        let rtp_packet_size = desc.rtp_packet_size();
+        let bytes_per_sample = desc.bytes_per_sample();
+
+        spawn(async move {
+            let mut socket_buf = init_buffer(desc.rtp_buffer_size(), || 0u8);
+
+            'main: loop {
+                for buf in socket_buf.chunks_mut(rtp_packet_size) {
+                    let len = match socket.recv(buf).await {
+                        Ok(it) => it,
+                        Err(e) => {
+                            log::error!("Socket I/O error: {e}");
+                            break 'main;
+                        }
+                    };
+
+                    if len != rtp_packet_size {
+                        log::warn!(
+                            "Unexpected number of bytes read: {} (expected packet length is {})",
+                            len,
+                            rtp_packet_size
+                        );
+                    }
+                }
+
+                let rtps = match RtpIter::new(&socket_buf, rtp_packet_size) {
+                    Ok(it) => it,
+                    Err(e) => {
+                        log::error!("Could not parse RTP packet: {e:?}");
+                        continue 'main;
+                    }
+                };
+
+                for rtp in rtps {
+                    for raw_sample in rtp.payload().chunks(bytes_per_sample) {
+                        let sample = read_f32_sample(raw_sample);
+                        if let Err(e) = sample_tx.send(sample).await {
+                            log::info!("Error forwarding sample: {e}");
+                            break 'main;
+                        }
+                    }
+                }
+            }
+        });
 
         let stream = device.build_output_stream(
             &config,
             move |output, _| {
-                if let Ok(cfg) = cfg_rx.try_recv() {
-                    // TODO apply config change
-                }
-
-                // TODO use link offset buffer!
-                if let Ok(len) = socket.try_recv(&mut buffer) {
-                    // TODO handle error
-                    if let Ok(rtp) = RtpReader::new(&buffer[0..len]) {
-                        // padding/offset?
-                        let audio_data = rtp.payload();
-                        let mut offset = 0;
-                        for i in 0..output.len() {
-                            let mut sample: i32 = 0;
-                            for o in 0..4 {
-                                if o < bytes_per_sample {
-                                    sample = (sample << 8) | audio_data[offset + o] as i32;
-                                } else {
-                                    sample = sample << 8;
-                                }
-                            }
-                            for _ in 0..4 - bytes_per_sample {
-                                sample = sample >> 8;
-                            }
-                            offset += bytes_per_sample;
-                            output[i] = audio_data[i];
-                        }
-                    }
+                let mut last = 0.0;
+                for sample in output.iter_mut() {
+                    *sample = sample_rx.try_recv().unwrap_or(last);
+                    last = *sample;
                 }
             },
             |e| {
@@ -823,26 +812,22 @@ impl RxEventLoop {
     }
 }
 
-fn read_sample(ch: usize, desc: &RxDescriptor, payload: &[u8]) -> i32 {
-    let bytes_per_sample = desc.bit_depth / 8;
-    let offset = ch * bytes_per_sample;
-    let mut sample: i32 = 0;
-    for i in 0..4 {
-        if i < bytes_per_sample {
-            sample = (sample | payload[offset + i] as i32) << 8;
-        } else {
-            sample = sample << 8;
-        }
-    }
-    for _ in 0..4 - bytes_per_sample {
-        sample = sample >> 8;
+fn pad_sample(payload: &[u8]) -> [u8; 4] {
+    let mut sample = [0, 0, 0, 0];
+    for (i, b) in payload.iter().enumerate() {
+        sample[i] = *b;
     }
     sample
 }
 
-fn packet_size(desc: &RxDescriptor) -> usize {
-    let samples = ((desc.packet_time * desc.sampling_rate as f32) / 1000.0).round() as usize;
-    desc.channels * samples
+fn read_i32_sample(payload: &[u8]) -> i32 {
+    let padded = pad_sample(payload);
+    i32::from_be_bytes(padded)
+}
+
+fn read_f32_sample(payload: &[u8]) -> f32 {
+    let i = read_i32_sample(payload);
+    (i as f64 / i32::MAX as f64) as f32
 }
 
 fn init_buffer<T>(size: usize, init: impl Fn() -> T) -> Box<[T]> {

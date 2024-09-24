@@ -71,7 +71,7 @@ pub enum RxError {
     #[error("could not apply receiver config: {0}")]
     RxCfgSendError(#[from] SendError<RxConfig>),
     #[error("invalid link offset: {0} (max is {1})")]
-    InvalidLinkOffset(usize, usize),
+    InvalidLinkOffset(f32, f32),
     #[error("playout device not found: {0}")]
     NoPlayoutDevice(String),
     #[error("could not build cpal stream: {0}")]

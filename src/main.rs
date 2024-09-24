@@ -51,9 +51,9 @@ struct Args {
     /// Number of output channels
     #[arg(short, long, default_value = "32")]
     outputs: usize,
-    /// Max link offset it packets
+    /// Max link offset it ms
     #[arg(short, long, default_value = "20")]
-    link_offset: usize,
+    link_offset: f32,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -80,11 +80,10 @@ async fn main() -> Result<()> {
 
 async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
     let port = args.port;
-    let max_link_offset_multiplier = args.link_offset;
+    let link_offset = args.link_offset;
 
     let rtp_tx = RtpTxApi::new(&subsys).into_diagnostic()?;
-    let rtp_rx =
-        RtpRxApi::new(&subsys, args.inputs, max_link_offset_multiplier).into_diagnostic()?;
+    let rtp_rx = RtpRxApi::new(&subsys, args.inputs, link_offset).into_diagnostic()?;
     let sap = SapApi::new(&subsys).into_diagnostic()?;
     let ptp = PtpApi::new(&subsys).into_diagnostic()?;
 
