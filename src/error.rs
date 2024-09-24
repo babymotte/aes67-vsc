@@ -19,9 +19,10 @@ use std::io;
 
 use crate::{
     ptp::PtpFunction,
-    rtp::{rx::RxFunction, tx::TxFunction, ReceiverId, RxThreadFunction},
+    rtp::{rx::RxFunction, tx::TxFunction, ReceiverId, RxConfig, RxThreadFunction},
     sap::SapFunction,
 };
+use cpal::BuildStreamError;
 use thiserror::Error;
 use tokio::sync::{mpsc::error::SendError, oneshot::error::RecvError};
 
@@ -67,6 +68,14 @@ pub enum RxError {
     InvalidReceiverId(ReceiverId),
     #[error("max channels exceeded: {0}")]
     MaxChannelsExceeded(usize),
+    #[error("could not apply receiver config: {0}")]
+    RxCfgSendError(#[from] SendError<RxConfig>),
+    #[error("invalid link offset: {0} (max is {1})")]
+    InvalidLinkOffset(usize, usize),
+    #[error("playout device not found: {0}")]
+    NoPlayoutDevice(String),
+    #[error("could not build cpal stream: {0}")]
+    BuildStreamError(#[from] BuildStreamError),
 }
 
 pub type RxResult<T> = Result<T, RxError>;

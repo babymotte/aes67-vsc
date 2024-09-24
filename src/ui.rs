@@ -143,11 +143,11 @@ pub fn ui(
 
             let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
                 .await
-                .unwrap();
+                .into_diagnostic()?;
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move { s.on_shutdown_requested().await })
                 .await
-                .unwrap();
+                .into_diagnostic()?;
 
             Ok(()) as Result<()>
         }));
