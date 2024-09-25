@@ -620,10 +620,6 @@ fn rx_thread(
 }
 
 struct RxEventLoop {
-    max_bit_depth: usize,
-    max_samples_per_frame: usize,
-    max_packet_len: usize,
-    max_rtp_overhead: usize,
     playout_streams: Box<[Option<oneshot::Sender<Response<()>>>]>,
     rx_descriptors: Box<[Option<RxDescriptor>]>,
     event_tx: mpsc::UnboundedSender<RxThreadEvent>,
@@ -631,20 +627,11 @@ struct RxEventLoop {
 
 impl RxEventLoop {
     fn new(event_tx: mpsc::UnboundedSender<RxThreadEvent>, max_channels: usize) -> Self {
-        let max_bit_depth = 24;
-        let max_samples_per_frame = 384;
-        let max_rtp_overhead = 60;
-        let max_packet_len = max_bit_depth * max_samples_per_frame + max_rtp_overhead;
-
         let playout_streams = init_buffer(max_channels, || None);
         let rx_descriptors = init_buffer(max_channels, || None);
 
         RxEventLoop {
             playout_streams,
-            max_bit_depth,
-            max_samples_per_frame,
-            max_packet_len,
-            max_rtp_overhead,
             rx_descriptors,
             event_tx,
         }
@@ -757,19 +744,20 @@ impl RxEventLoop {
             move |_, _, _| jack::Control::Continue,
         );
 
-        // 4. Activate the client. Also connect the ports to the system audio.
+        // 4. Activate the client
         let active_client = client.activate_async((), process).unwrap();
 
-        for ch in (1..desc.channels + 1).take(2) {
-            active_client
-                .as_client()
-                .connect_ports_by_name(
-                    &format!("{}:{}", desc.session_name, ch),
-                    &format!("REAPER:in{}", ch),
-                )
-                .unwrap();
-        }
-        // processing starts here
+        // connect the ports to the system audio.
+
+        // for ch in (1..desc.channels + 1).take(2) {
+        //     active_client
+        //         .as_client()
+        //         .connect_ports_by_name(
+        //             &format!("{}:{}", desc.session_name, ch),
+        //             &format!("REAPER:in{}", ch),
+        //         )
+        //         .unwrap();
+        // }
 
         // generic
 
