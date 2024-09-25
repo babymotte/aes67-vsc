@@ -20,21 +20,21 @@ import FormGroup from "@mui/material/FormGroup";
 import TextField from "@mui/material/TextField";
 import Button from "@mui/material/Button";
 import { Stack, Typography } from "@mui/material";
-import { useCreateTransmitter } from "../../api";
+import { useReceiveStream } from "../../api";
 
-export default function CreateSenderForm() {
+export default function CreateReceiverForm() {
   const [sdp, setSdp] = React.useState<string | undefined>();
 
-  const create = useCreateTransmitter(sdp);
+  const create = useReceiveStream(sdp);
   const submit = () =>
     create()
       .then((sid) => console.log(sid))
-      .catch((e) => console.error("Transmitter creation failed:", e.message));
+      .catch((e) => console.error("Receiver creation failed:", e.message));
 
   return (
     <FormGroup>
       <Stack spacing={2} padding={2}>
-        <Typography>Create Transmitter</Typography>
+        <Typography>Create Receiver</Typography>
         <TextField multiline onChange={(e) => setSdp(e.target.value)} />
         <Button variant="contained" onClick={submit}>
           Create

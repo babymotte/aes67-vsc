@@ -56,3 +56,26 @@ export function useCreateTransmitter(
       }
     });
 }
+
+export function useReceiveStream(
+  sdp: string | undefined
+): () => Promise<string> {
+  return () =>
+    new Promise((res, rej) => {
+      if (sdp) {
+        axios
+          .post("/api/v1/receive/stream", { sdp })
+          .then((resp) => {
+            const { sessionId, error } = resp.data;
+            if (sessionId) {
+              res(sessionId);
+            } else if (error) {
+              rej(new Error(error));
+            }
+          })
+          .catch((e) => rej(new Error(e.message)));
+      } else {
+        rej(new Error("SDP is empty"));
+      }
+    });
+}

@@ -16,14 +16,14 @@
  */
 
 import Paper from "@mui/material/Paper";
-import CreateSenderForm from "./components/create_sender/CreateSenderForm";
+import CreateReceiverForm from "./components/create_sender/CreateReceiverForm";
 import Stack from "@mui/material/Stack";
 
 function App() {
   return (
     <Stack alignItems="center" justifyContent="center">
       <Paper>
-        <CreateSenderForm />
+        <CreateReceiverForm />
       </Paper>
     </Stack>
   );
