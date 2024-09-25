@@ -247,7 +247,9 @@ impl RtpRxApi {
                 max_channels,
                 link_offset,
             );
-            let res = actor.run(s.create_cancellation_token()).await;
+            let res = actor
+                .run("rtp-rx".to_owned(), s.create_cancellation_token())
+                .await;
             stop_tx.send(()).ok();
             log::info!("RX thread terminated.");
             s.request_shutdown();
@@ -307,10 +309,13 @@ impl Actor for RtpRxActor {
         }
     }
 
-    async fn run(&mut self, cancel_token: CancellationToken) -> RxResult<()> {
+    async fn run(&mut self, name: String, cancel_token: CancellationToken) -> RxResult<()> {
         loop {
             select! {
-                _ = cancel_token.cancelled() => break,
+                _ = cancel_token.cancelled() => {
+                    log::info!("Shutdown requested, stopping actor {name} …");
+                    break
+                },
                 Some(msg) = self.commands.recv() => if !self.process_message(msg).await {
                     break;
                 },
@@ -539,6 +544,9 @@ async fn create_rx_socket(sdp: &SessionDescription) -> Result<UdpSocket, RxError
         IpAddr::V4(ipv4_addr) => create_ipv4_socket(ipv4_addr, port)?,
         IpAddr::V6(ipv6_addr) => create_ipv6_socket(ipv6_addr, port)?,
     };
+    socket.set_reuse_address(true)?;
+    socket.set_reuse_port(true)?;
+    socket.set_nonblocking(true)?;
 
     let tokio_socket = UdpSocket::from_std(socket.into())?;
 
@@ -565,8 +573,6 @@ fn create_ipv4_socket(ip_addr: Ipv4Addr, port: u16) -> Result<Socket, RxError> {
     let local_addr = SocketAddr::new(IpAddr::V4(local_ip), port);
 
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.set_reuse_address(true)?;
-    socket.set_reuse_port(true)?;
     socket.bind(&SockAddr::from(local_addr))?;
     if ip_addr.is_multicast() {
         socket.join_multicast_v4(&ip_addr, &local_ip)?
@@ -594,8 +600,6 @@ fn create_ipv6_socket(ip_addr: Ipv6Addr, port: u16) -> Result<Socket, RxError> {
     let local_addr = SocketAddr::new(IpAddr::V6(local_ip), port);
 
     let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.set_reuse_address(true)?;
-    socket.set_reuse_port(true)?;
     socket.bind(&SockAddr::from(local_addr))?;
     if ip_addr.is_multicast() {
         socket.join_multicast_v6(&ip_addr, 0)?
@@ -687,6 +691,9 @@ impl RxEventLoop {
         drop(self.rx_descriptors[index].take());
         if let Some(ctrl_tx) = self.playout_streams[index].take() {
             ctrl_tx.send(tx).ok();
+        } else {
+            log::warn!("Playout stream for receiver '{index}' does not exist.");
+            tx.send(Ok(())).ok();
         }
     }
 
@@ -764,44 +771,54 @@ impl RxEventLoop {
         spawn(async move {
             let mut socket_buf = init_buffer(desc.rtp_buffer_size(), || 0u8);
 
+            let close = move |tx: Response<()>| async move {
+                if let Err(err) = active_client.deactivate() {
+                    tx.send(Err(RxError::IoError(io::Error::new(
+                        io::ErrorKind::Other,
+                        err,
+                    ))))
+                    .ok();
+                } else {
+                    tx.send(Ok(())).ok();
+                }
+            };
+
             'main: loop {
                 // TODO fade out before close
                 match control_rx.try_recv() {
                     Ok(resp) => {
-                        if let Err(err) = active_client.deactivate() {
-                            resp.send(Err(RxError::IoError(io::Error::new(
-                                io::ErrorKind::Other,
-                                err,
-                            ))))
-                            .ok();
-                        } else {
-                            resp.send(Ok(())).ok();
-                        }
-                        break;
+                        close(resp).await;
+                        break 'main;
                     }
                     Err(e) => match e {
                         oneshot::error::TryRecvError::Empty => (),
-                        oneshot::error::TryRecvError::Closed => break,
+                        oneshot::error::TryRecvError::Closed => break 'main,
                     },
                 }
 
                 // TODO fade in on start
 
                 for buf in socket_buf.chunks_mut(rtp_packet_size) {
-                    let len = match socket.recv(buf).await {
-                        Ok(it) => it,
-                        Err(e) => {
-                            log::error!("Socket I/O error: {e}");
-                            break 'main;
+                    select! {
+                        Ok(tx) = &mut control_rx => {
+                            close(tx).await;
+                            break 'main
+                        },
+                        recv = socket.recv(buf) => match recv {
+                            Ok(len) => {
+                                if len != rtp_packet_size {
+                                    log::warn!(
+                                        "Unexpected number of bytes read: {} (expected packet length is {})",
+                                        len,
+                                        rtp_packet_size
+                                    );
+                                }
+                            },
+                            Err(e) => {
+                                log::error!("Socket I/O error: {e}");
+                                break 'main;
+                            }
                         }
-                    };
-
-                    if len != rtp_packet_size {
-                        log::warn!(
-                            "Unexpected number of bytes read: {} (expected packet length is {})",
-                            len,
-                            rtp_packet_size
-                        );
                     }
                 }
 
@@ -816,9 +833,16 @@ impl RxEventLoop {
                 for rtp in rtps {
                     for raw_sample in rtp.payload().chunks(bytes_per_sample) {
                         let sample = read_f32_sample(raw_sample);
-                        if let Err(e) = audio_tx.send(sample).await {
-                            log::info!("Error forwarding sample: {e}");
-                            break 'main;
+                        select! {
+                            Ok(tx) = &mut control_rx => {
+                                close(tx).await;
+                                break 'main
+                            },
+                            snd = audio_tx.send(sample) => if let Err(e) = snd {
+                                log::info!("Error forwarding sample: {e}");
+                                break 'main;
+                            },
+                            else => break 'main,
                         }
                     }
                 }

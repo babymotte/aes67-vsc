@@ -42,7 +42,9 @@ impl PtpApi {
 
         subsys.start(SubsystemBuilder::new("ptp", |s| async move {
             let mut actor = PtpActor::new(commands);
-            actor.run(s.create_cancellation_token()).await
+            actor
+                .run("ptp".to_owned(), s.create_cancellation_token())
+                .await
         }));
 
         Ok(PtpApi { channel })

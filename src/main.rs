@@ -28,10 +28,12 @@ use miette::{IntoDiagnostic, Result};
 use std::{io, time::Duration};
 #[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
 use tikv_jemallocator::Jemalloc;
+use tokio::{select, sync::oneshot};
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle, Toplevel};
 use tracing_log::AsTrace;
 use tracing_subscriber::EnvFilter;
 use ui::ui;
+use worterbuch_client::connect_with_default_config;
 
 #[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
 #[global_allocator]
@@ -82,12 +84,27 @@ async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
     let port = args.port;
     let link_offset = args.link_offset;
 
+    let (wb_disco, mut wb_on_disco) = oneshot::channel();
+
+    let on_disconnect = async move {
+        log::info!("Worterbuch disconnected, requesting shutdown.");
+        wb_disco.send(()).ok();
+    };
+    let (wb, _) = connect_with_default_config(on_disconnect)
+        .await
+        .into_diagnostic()?;
+
     let rtp_tx = RtpTxApi::new(&subsys).into_diagnostic()?;
     let rtp_rx = RtpRxApi::new(&subsys, args.inputs, link_offset).into_diagnostic()?;
-    let sap = SapApi::new(&subsys).into_diagnostic()?;
+    let sap = SapApi::new(&subsys, wb.clone()).into_diagnostic()?;
     let ptp = PtpApi::new(&subsys).into_diagnostic()?;
 
-    ui(&subsys, rtp_tx, rtp_rx, ptp, sap, port)?;
+    ui(&subsys, rtp_tx, rtp_rx, ptp, sap, port, wb.clone()).await?;
+
+    select! {
+        _ = subsys.on_shutdown_requested() => (),
+        _ = &mut wb_on_disco => subsys.request_shutdown(),
+    }
 
     Ok(())
 }

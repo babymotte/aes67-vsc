@@ -27,7 +27,9 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
+use worterbuch_client::{topic, Worterbuch};
 
+#[derive(Debug, Clone)]
 pub struct SapApi {
     channel: mpsc::Sender<SapFunction>,
 }
@@ -42,13 +44,14 @@ impl ActorApi for SapApi {
 }
 
 impl SapApi {
-    pub fn new(subsys: &SubsystemHandle) -> Result<Self, SapError> {
+    pub fn new(subsys: &SubsystemHandle, wb: Worterbuch) -> Result<Self, SapError> {
         let (channel, messages) = mpsc::channel(1);
 
         subsys.start(SubsystemBuilder::new("sap", |s| async move {
             let token = s.create_cancellation_token();
-            let mut actor = SapActor::new(s, messages);
-            actor.run(token).await
+            let mut actor = SapActor::new(s, messages, wb.clone());
+            actor.start_discovery(wb.clone()).await?;
+            actor.run("sap".to_owned(), token).await
         }));
 
         Ok(SapApi { channel })
@@ -78,6 +81,7 @@ struct SapActor {
     subsys: SubsystemHandle,
     sessions: HashMap<String, oneshot::Sender<()>>,
     messages: mpsc::Receiver<SapFunction>,
+    wb: Worterbuch,
 }
 
 impl Actor for SapActor {
@@ -97,20 +101,62 @@ impl Actor for SapActor {
 }
 
 impl SapActor {
-    fn new(subsys: SubsystemHandle, messages: mpsc::Receiver<SapFunction>) -> Self {
+    fn new(subsys: SubsystemHandle, messages: mpsc::Receiver<SapFunction>, wb: Worterbuch) -> Self {
         let sessions = HashMap::new();
         SapActor {
             sessions,
             subsys,
             messages,
+            wb,
         }
     }
 
-    async fn add_session(&mut self, sdp: SessionDescription) -> Result<String, SapError> {
+    async fn start_discovery(&mut self, wb: Worterbuch) -> Result<(), SapError> {
+        log::info!("Starting SAP discovery …");
         let sap = Sap::new().await?;
-        let session_id = format!("{}/{}", sdp.origin.session_id, sdp.origin.session_version);
+        self.subsys
+            .start(SubsystemBuilder::new("discovery", move |s| async move {
+                let mut discovery = sap.discover_sessions().await;
+                log::info!("SAP discovery running.");
+                loop {
+                    select! {
+                        _ = s.on_shutdown_requested() => break,
+                        Some(session) = discovery.recv() => {
+                            match session {
+                                Ok(sa) => {
+                                    // TODO use customized key?
+                                    log::info!("Received SAP announcement …");
+                                    let key = topic!("aes67-vsc/discovery/sap", sa.originating_source.to_string(), sa.msg_id_hash);
+                                    if sa.deletion {
+                                        log::debug!("SDP {} was deleted by {}.", sa.msg_id_hash, sa.originating_source);
+                                        wb.delete::<String>(key).await?;
+                                    } else {
+                                        let sdp = sa.sdp.marshal();
+                                        log::debug!("SDP {} was announced by {}:\n{}", sa.msg_id_hash, sa.originating_source, sdp);
+                                        wb.set(key, sdp).await?;
+                                    }
+                                },
+                                Err(e) => {
+                                    log::warn!("Received invalid session announcement: {e}");
+                                }
+                            }
+                        },
+                        else => break,
+                    }
+                }
+                Ok::<(), SapError>(())
+            }));
+
+        Ok(())
+    }
+
+    async fn add_session(&mut self, sdp: SessionDescription) -> Result<String, SapError> {
+        let session_id = format!("{} {}", sdp.origin.session_id, sdp.origin.session_version);
+        log::info!("Adding session {session_id} …");
+        let sap = Sap::new().await?;
         let session = Self::announce(sap, sdp, &self.subsys, &session_id).await?;
         self.sessions.insert(session_id.clone(), session);
+        log::info!("Session {session_id} added.");
         Ok(session_id)
     }
 

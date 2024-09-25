@@ -85,6 +85,8 @@ pub enum SapError {
     SendError(#[from] SendError<SapFunction>),
     #[error("channel error: {0}")]
     ReceiveError(#[from] RecvError),
+    #[error("error in worterbuch connection: {0}")]
+    WorterbuchError(#[from] worterbuch_client::ConnectionError),
 }
 pub type SapResult<T> = Result<T, SapError>;
 

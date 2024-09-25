@@ -42,7 +42,9 @@ impl RtpTxApi {
 
         subsys.start(SubsystemBuilder::new("rtp/tx", |s| async move {
             let mut actor = RtpTxActor::new(commands);
-            actor.run(s.create_cancellation_token()).await
+            actor
+                .run("rtp-rx".to_owned(), s.create_cancellation_token())
+                .await
         }));
 
         Ok(RtpTxApi { channel })

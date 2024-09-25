@@ -33,7 +33,7 @@ use miette::{IntoDiagnostic, Result};
 use pnet::{datalink, ipnetwork::IpNetwork};
 use sdp::SessionDescription;
 use serde::{Deserialize, Serialize};
-use std::{env, io::Cursor, sync::mpsc::Receiver};
+use std::{env, io::Cursor};
 use thiserror::Error;
 use tokio::sync::{
     mpsc::{self, error::SendError},
@@ -41,6 +41,7 @@ use tokio::sync::{
 };
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
 use tower_http::services::{ServeDir, ServeFile};
+use worterbuch_client::Worterbuch;
 
 #[derive(Error, Debug)]
 enum UiError {
@@ -63,6 +64,7 @@ struct UiActor {
     ptp: PtpApi,
     sap: SapApi,
     ui_commands: mpsc::Receiver<UiFunction>,
+    wb: Worterbuch,
 }
 
 impl Actor for UiActor {
@@ -105,13 +107,14 @@ impl UiActor {
     }
 }
 
-pub fn ui(
+pub async fn ui(
     subsys: &SubsystemHandle,
     rtp_tx: RtpTxApi,
     rtp_rx: RtpRxApi,
     ptp: PtpApi,
     sap: SapApi,
     port: u16,
+    wb: Worterbuch,
 ) -> Result<()> {
     subsys.start(SubsystemBuilder::new("ui", move |s| async move {
         let webapp_root_dir =
@@ -152,7 +155,7 @@ pub fn ui(
             Ok(()) as Result<()>
         }));
 
-        let cancel_toke = s.create_cancellation_token();
+        let cancel_token = s.create_cancellation_token();
 
         let mut actor = UiActor {
             ptp,
@@ -161,9 +164,14 @@ pub fn ui(
             sap,
             subsys: s,
             ui_commands,
+            wb,
         };
 
-        actor.run(cancel_toke).await.into_diagnostic()?;
+        actor
+            .run("ui".to_owned(), cancel_token)
+            .await
+            .into_diagnostic()?;
+        actor.subsys.request_shutdown();
 
         Ok(()) as Result<()>
     }));

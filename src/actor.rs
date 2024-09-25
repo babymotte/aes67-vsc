@@ -29,10 +29,17 @@ pub trait Actor {
     async fn recv_message(&mut self) -> Option<Self::Message>;
     async fn process_message(&mut self, msg: Self::Message) -> bool;
 
-    async fn run(&mut self, cancel_token: CancellationToken) -> Result<(), Self::Error> {
+    async fn run(
+        &mut self,
+        name: String,
+        cancel_token: CancellationToken,
+    ) -> Result<(), Self::Error> {
         loop {
             select! {
-                _ = cancel_token.cancelled() => break,
+                _ = cancel_token.cancelled() => {
+                    log::info!("Shutdown requested, stopping actor {name} …");
+                    break;
+                },
                 recv = self.recv_message() => match recv {
                     Some(msg) => if !self.process_message(msg).await {
                         break;
