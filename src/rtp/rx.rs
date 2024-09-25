@@ -21,30 +21,23 @@ use crate::{
     utils::{session_id, RtpIter},
 };
 use core::f32;
-use cpal::{
-    traits::{DeviceTrait, HostTrait, StreamTrait},
-    BufferSize, HostId, SampleRate, Stream, StreamConfig,
-};
-use rtp_rs::{RtpReader, Seq};
+use jack::{AudioOut, Port};
 use sdp::{
     description::common::{Address, ConnectionInformation},
     SessionDescription,
 };
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::{
-    backtrace,
-    cell::Cell,
     collections::HashMap,
-    iter,
+    io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     thread,
-    time::Instant,
 };
 use tokio::{
     net::UdpSocket,
     runtime, select, spawn,
     sync::{
-        mpsc::{self},
+        mpsc::{self, error::TryRecvError},
         oneshot,
     },
 };
@@ -56,6 +49,8 @@ pub(crate) type ReceiverId = usize;
 #[derive(Debug, Clone)]
 pub struct RxDescriptor {
     pub id: usize,
+    pub session_name: String,
+    pub session_id: u64,
     pub bit_depth: usize,
     pub channels: usize,
     pub sampling_rate: usize,
@@ -116,8 +111,13 @@ impl RxDescriptor {
             return Err(RxError::InvalidSdp("no ptime".to_owned()));
         };
 
+        let session_name = sd.session_name.clone();
+        let session_id = sd.origin.session_id;
+
         Ok(RxDescriptor {
             id: receiver_id,
+            session_name,
+            session_id,
             bit_depth,
             channels,
             sampling_rate,
@@ -624,21 +624,9 @@ struct RxEventLoop {
     max_samples_per_frame: usize,
     max_packet_len: usize,
     max_rtp_overhead: usize,
-    playout_streams: Box<[Option<CpalStream>]>,
+    playout_streams: Box<[Option<oneshot::Sender<Response<()>>>]>,
     rx_descriptors: Box<[Option<RxDescriptor>]>,
     event_tx: mpsc::UnboundedSender<RxThreadEvent>,
-}
-
-struct CpalStream {
-    receiver_id: usize,
-    stream: Option<Stream>,
-}
-
-impl Drop for CpalStream {
-    fn drop(&mut self) {
-        log::info!("Dropping cpal stream for receiver '{}'.", self.receiver_id);
-        drop(self.stream.take());
-    }
 }
 
 impl RxEventLoop {
@@ -694,58 +682,123 @@ impl RxEventLoop {
         tx: Response<()>,
     ) {
         self.rx_descriptors[index] = Some(desc.clone());
-        if let Err(e) = self.playout_stream(index, socket, desc) {
-            log::error!("Error playing out receiver stream: {e}");
-            tx.send(Err(e)).ok();
-        } else {
-            tx.send(Ok(())).ok();
-        }
+        let (control_tx, control_rx) = oneshot::channel();
+        spawn(async move {
+            if let Err(e) = Self::playout_stream(socket, desc, control_rx).await {
+                log::error!("Error playing out receiver stream: {e}");
+                tx.send(Err(e)).ok();
+            } else {
+                tx.send(Ok(())).ok();
+            }
+        });
+
+        self.playout_streams[index] = Some(control_tx);
     }
 
     fn stop_receiver(&mut self, index: usize, tx: Response<()>) {
+        log::info!("Stopping receiver '{index}' …");
         drop(self.rx_descriptors[index].take());
-        drop(self.playout_streams[index].take());
-        tx.send(Ok(())).ok();
+        if let Some(ctrl_tx) = self.playout_streams[index].take() {
+            ctrl_tx.send(tx).ok();
+        }
     }
 
-    fn playout_stream(
-        &mut self,
-        receiver_id: usize,
+    async fn playout_stream(
         socket: UdpSocket,
         desc: RxDescriptor,
+        mut control_rx: oneshot::Receiver<Response<()>>,
     ) -> RxResult<()> {
-        let host = cpal::host_from_id(HostId::Jack).unwrap_or_else(|_| cpal::default_host());
-        // let host = cpal::default_host();
-
-        log::info!("Host: {:?}", host.id());
-
-        let device = if let Some(it) = host.default_output_device() {
-            log::info!("Output device: {:?}", it.name());
-            it
-        } else {
-            log::error!("no default output device");
-            return Err(RxError::NoPlayoutDevice("default".to_owned()));
-        };
-
-        log::info!("{:?}", device.default_output_config());
-
-        let config = StreamConfig {
-            channels: desc.channels as u16,
-            sample_rate: SampleRate(desc.sampling_rate as u32),
-            buffer_size: BufferSize::Fixed(desc.frames_per_link_offset_buffer() as u32),
-        };
-
-        log::debug!("stream config: {config:?}");
-
-        let (sample_tx, mut sample_rx) = mpsc::channel(2 * desc.rtp_buffer_size());
+        // init
 
         let rtp_packet_size = desc.rtp_packet_size();
         let bytes_per_sample = desc.bytes_per_sample();
+
+        let (audio_tx, audio_rx) = mpsc::channel(2 * desc.rtp_buffer_size());
+
+        // JACK specific
+
+        // 1. open a client
+        let (client, _status) =
+            jack::Client::new(&desc.session_name, jack::ClientOptions::default()).unwrap();
+
+        let spec = jack::AudioOut::default();
+
+        let ports: Vec<Port<AudioOut>> = (0..desc.channels)
+            .map(|i| client.register_port(&(i + 1).to_string(), spec).unwrap())
+            .collect();
+
+        // 3. define process callback handler
+        struct State {
+            ports: Vec<Port<AudioOut>>,
+            audio_rx: mpsc::Receiver<f32>,
+        }
+        let process = jack::contrib::ClosureProcessHandler::with_state(
+            State { ports, audio_rx },
+            |state, _, ps| -> jack::Control {
+                // Get output buffer
+                let channels = state.ports.len();
+                let buffer_size = state.ports[0].as_mut_slice(ps).len();
+
+                for i in 0..buffer_size {
+                    for ch in 0..channels {
+                        state.ports[ch].as_mut_slice(ps)[i] = match state.audio_rx.try_recv() {
+                            Ok(sample) => sample,
+                            Err(e) => match e {
+                                TryRecvError::Empty => 0.0,
+                                TryRecvError::Disconnected => return jack::Control::Quit,
+                            },
+                        };
+                    }
+                }
+
+                // Continue as normal
+                jack::Control::Continue
+            },
+            move |_, _, _| jack::Control::Continue,
+        );
+
+        // 4. Activate the client. Also connect the ports to the system audio.
+        let active_client = client.activate_async((), process).unwrap();
+
+        for ch in (1..desc.channels + 1).take(2) {
+            active_client
+                .as_client()
+                .connect_ports_by_name(
+                    &format!("{}:{}", desc.session_name, ch),
+                    &format!("REAPER:in{}", ch),
+                )
+                .unwrap();
+        }
+        // processing starts here
+
+        // generic
 
         spawn(async move {
             let mut socket_buf = init_buffer(desc.rtp_buffer_size(), || 0u8);
 
             'main: loop {
+                // TODO fade out before close
+                match control_rx.try_recv() {
+                    Ok(resp) => {
+                        if let Err(err) = active_client.deactivate() {
+                            resp.send(Err(RxError::IoError(io::Error::new(
+                                io::ErrorKind::Other,
+                                err,
+                            ))))
+                            .ok();
+                        } else {
+                            resp.send(Ok(())).ok();
+                        }
+                        break;
+                    }
+                    Err(e) => match e {
+                        oneshot::error::TryRecvError::Empty => (),
+                        oneshot::error::TryRecvError::Closed => break,
+                    },
+                }
+
+                // TODO fade in on start
+
                 for buf in socket_buf.chunks_mut(rtp_packet_size) {
                     let len = match socket.recv(buf).await {
                         Ok(it) => it,
@@ -775,7 +828,7 @@ impl RxEventLoop {
                 for rtp in rtps {
                     for raw_sample in rtp.payload().chunks(bytes_per_sample) {
                         let sample = read_f32_sample(raw_sample);
-                        if let Err(e) = sample_tx.send(sample).await {
+                        if let Err(e) = audio_tx.send(sample).await {
                             log::info!("Error forwarding sample: {e}");
                             break 'main;
                         }
@@ -783,30 +836,6 @@ impl RxEventLoop {
                 }
             }
         });
-
-        let stream = device.build_output_stream(
-            &config,
-            move |output, _| {
-                let mut last = 0.0;
-                for sample in output.iter_mut() {
-                    *sample = sample_rx.try_recv().unwrap_or(last);
-                    last = *sample;
-                }
-            },
-            |e| {
-                log::error!("Error in cpal stream: {e}");
-            },
-            None,
-        )?;
-
-        if let Err(e) = stream.play() {
-            log::error!("Playback error: {e}");
-        } else {
-            self.playout_streams[receiver_id] = Some(CpalStream {
-                receiver_id,
-                stream: Some(stream),
-            });
-        }
 
         Ok(())
     }

@@ -1,7 +1,6 @@
-use std::{iter::Map, slice::Chunks, u16};
-
 use rtp_rs::{RtpReader, RtpReaderError, Seq};
 use sdp::SessionDescription;
+use std::{iter::Map, slice::Chunks, u16};
 
 pub fn session_id(sdp: &SessionDescription) -> String {
     format!("{} {}", sdp.origin.session_id, sdp.origin.session_version)

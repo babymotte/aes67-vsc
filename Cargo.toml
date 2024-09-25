@@ -17,8 +17,8 @@ default = ["jemalloc"]
 axum = { version = "0.7.5", features = ["http2"] }
 clap = { version = "4.5.17", features = ["derive"] }
 clap-verbosity-flag = "2.2.1"
-cpal = { version = "0.15.3", features = ["jack"] }
 dotenv = "0.15.0"
+jack = "0.13.0"
 log = "0.4.22"
 miette = { version = "7.2.0", features = ["fancy"] }
 pnet = "0.35.0"
