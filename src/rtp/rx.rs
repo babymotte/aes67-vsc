@@ -18,7 +18,9 @@
 use crate::{
     actor::{respond, Actor, ActorApi},
     error::{RxError, RxResult},
+    status::{Receiver, Status, StatusApi},
     utils::{session_id, RtpIter},
+    ReceiverId,
 };
 use core::f32;
 use jack::{AudioOut, Port};
@@ -44,13 +46,12 @@ use tokio::{
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
 use tokio_util::sync::CancellationToken;
 
-pub(crate) type ReceiverId = usize;
-
 #[derive(Debug, Clone)]
 pub struct RxDescriptor {
     pub id: usize,
     pub session_name: String,
     pub session_id: u64,
+    pub session_version: u64,
     pub bit_depth: usize,
     pub channels: usize,
     pub sampling_rate: usize,
@@ -113,11 +114,13 @@ impl RxDescriptor {
 
         let session_name = sd.session_name.clone();
         let session_id = sd.origin.session_id;
+        let session_version = sd.origin.session_version;
 
         Ok(RxDescriptor {
             id: receiver_id,
             session_name,
             session_id,
+            session_version,
             bit_depth,
             channels,
             sampling_rate,
@@ -168,6 +171,10 @@ impl RxDescriptor {
 
     pub fn rtp_buffer_size(&self) -> usize {
         f32::ceil(self.packets_in_link_offset() * self.rtp_packet_size() as f32) as usize
+    }
+
+    pub fn to_link_offset(&self, samples: usize) -> usize {
+        f32::ceil(samples as f32 / (self.sampling_rate as f32 / 1000.0)) as usize
     }
 }
 
@@ -221,6 +228,7 @@ impl RtpRxApi {
         subsys: &SubsystemHandle,
         max_channels: usize,
         link_offset: f32,
+        status: StatusApi,
     ) -> Result<Self, RxError> {
         let (channel, commands) = mpsc::channel(1);
 
@@ -228,6 +236,7 @@ impl RtpRxApi {
         let (rx_thread_event_tx, rx_thread_event_rx) = mpsc::unbounded_channel();
         let (stop_tx, stop_rx) = oneshot::channel();
 
+        let rx_st = status.clone();
         thread::Builder::new()
             .name("rx-thread".to_string())
             .spawn(move || {
@@ -236,6 +245,7 @@ impl RtpRxApi {
                     rx_thread_event_tx,
                     stop_rx,
                     max_channels,
+                    rx_st,
                 )
             })?;
 
@@ -246,7 +256,9 @@ impl RtpRxApi {
                 rx_thread_event_rx,
                 max_channels,
                 link_offset,
+                status,
             );
+            actor.log_channel_consumption().await?;
             let res = actor
                 .run("rtp-rx".to_owned(), s.create_cancellation_token())
                 .await;
@@ -292,6 +304,7 @@ struct RtpRxActor {
     max_channels: usize,
     used_channels: usize,
     link_offset: f32,
+    status: StatusApi,
 }
 
 impl Actor for RtpRxActor {
@@ -337,6 +350,7 @@ impl RtpRxActor {
         rx_thread_event_rx: mpsc::UnboundedReceiver<RxThreadEvent>,
         max_channels: usize,
         link_offset: f32,
+        status: StatusApi,
     ) -> Self {
         let receiver_ids = HashMap::new();
         let active_receivers = vec![None; max_channels];
@@ -349,6 +363,7 @@ impl RtpRxActor {
             max_channels,
             used_channels: 0,
             link_offset,
+            status,
         }
     }
 
@@ -405,12 +420,11 @@ impl RtpRxActor {
         self.receiver_ids.insert(session_id.clone(), desc.clone());
         self.active_receivers[receiver_id] = Some(session_id);
         self.used_channels += desc.channels;
+        self.status
+            .publish(Status::Receiver(Receiver::Created(desc.clone())))
+            .await?;
         log::info!("Receiver {receiver_id} created.");
-        log::info!(
-            "Used up channels: {}/{}",
-            self.used_channels,
-            self.max_channels
-        );
+        self.log_channel_consumption().await?;
         Ok(())
     }
 
@@ -434,16 +448,30 @@ impl RtpRxActor {
                 .send(RxThreadFunction::StopReceiver(receiver_id, tx))
                 .await?;
             rx.await??;
+            self.status
+                .publish(Status::Receiver(Receiver::Deleted(desc.clone())))
+                .await?;
             log::info!("Receiver {receiver_id} deleted.",);
-            log::info!(
-                "Used up channels: {}/{}",
-                self.used_channels,
-                self.max_channels
-            );
+            self.log_channel_consumption().await?;
         } else {
             log::warn!("Receiver '{receiver_id}' does not exist.");
         }
 
+        Ok(())
+    }
+
+    async fn log_channel_consumption(&self) -> RxResult<()> {
+        log::info!(
+            "Used up channels: {}/{}",
+            self.used_channels,
+            self.max_channels
+        );
+        self.status
+            .publish(Status::UsedOutputChannels(
+                self.used_channels,
+                self.max_channels,
+            ))
+            .await?;
         Ok(())
     }
 }
@@ -612,13 +640,15 @@ fn rx_thread(
     event_tx: mpsc::UnboundedSender<RxThreadEvent>,
     stop_rx: oneshot::Receiver<()>,
     max_channels: usize,
+    status: StatusApi,
 ) -> RxResult<()> {
     // makes sure a 'thread stopped' event is sent out even in the event of a panic
     let destructor = RxThreadDestructor {
         event_tx: event_tx.clone(),
     };
     let rt = runtime::Builder::new_current_thread().build()?;
-    let res = rt.block_on(RxEventLoop::new(event_tx.clone(), max_channels).run(fun_rx, stop_rx));
+    let res =
+        rt.block_on(RxEventLoop::new(event_tx.clone(), max_channels, status).run(fun_rx, stop_rx));
     drop(destructor);
     res
 }
@@ -627,10 +657,15 @@ struct RxEventLoop {
     playout_streams: Box<[Option<oneshot::Sender<Response<()>>>]>,
     rx_descriptors: Box<[Option<RxDescriptor>]>,
     event_tx: mpsc::UnboundedSender<RxThreadEvent>,
+    status: StatusApi,
 }
 
 impl RxEventLoop {
-    fn new(event_tx: mpsc::UnboundedSender<RxThreadEvent>, max_channels: usize) -> Self {
+    fn new(
+        event_tx: mpsc::UnboundedSender<RxThreadEvent>,
+        max_channels: usize,
+        status: StatusApi,
+    ) -> Self {
         let playout_streams = init_buffer(max_channels, || None);
         let rx_descriptors = init_buffer(max_channels, || None);
 
@@ -638,6 +673,7 @@ impl RxEventLoop {
             playout_streams,
             rx_descriptors,
             event_tx,
+            status,
         }
     }
 
@@ -674,8 +710,9 @@ impl RxEventLoop {
     ) {
         self.rx_descriptors[index] = Some(desc.clone());
         let (control_tx, control_rx) = oneshot::channel();
+        let status = self.status.clone();
         spawn(async move {
-            if let Err(e) = Self::playout_stream(socket, desc, control_rx).await {
+            if let Err(e) = Self::playout_stream(socket, desc, control_rx, status).await {
                 log::error!("Error playing out receiver stream: {e}");
                 tx.send(Err(e)).ok();
             } else {
@@ -701,13 +738,14 @@ impl RxEventLoop {
         socket: UdpSocket,
         desc: RxDescriptor,
         mut control_rx: oneshot::Receiver<Response<()>>,
+        status: StatusApi,
     ) -> RxResult<()> {
         // init
 
         let rtp_packet_size = desc.rtp_packet_size();
         let bytes_per_sample = desc.bytes_per_sample();
 
-        let (audio_tx, audio_rx) = mpsc::channel(2 * desc.rtp_buffer_size());
+        let (audio_tx, audio_rx) = mpsc::channel(desc.rtp_buffer_size());
 
         // JACK specific
 
@@ -725,22 +763,40 @@ impl RxEventLoop {
         struct State {
             ports: Vec<Port<AudioOut>>,
             audio_rx: mpsc::Receiver<f32>,
+            buf_size: usize,
+            desc: RxDescriptor,
+            status: StatusApi,
         }
+
         let process = jack::contrib::ClosureProcessHandler::with_state(
-            State { ports, audio_rx },
+            State {
+                ports,
+                audio_rx,
+                buf_size: 0,
+                desc: desc.clone(),
+                status,
+            },
             |state, _, ps| -> jack::Control {
                 // Get output buffer
                 let channels = state.ports.len();
                 let buffer_size = state.ports[0].as_mut_slice(ps).len();
 
+                if state.buf_size != buffer_size {
+                    state.buf_size = buffer_size;
+                    state
+                        .status
+                        .publish_blocking(Status::Receiver(Receiver::LinkOffset(
+                            state.desc.id,
+                            state.desc.to_link_offset(buffer_size),
+                        )))
+                        .ok();
+                }
+
                 for i in 0..buffer_size {
                     for ch in 0..channels {
-                        state.ports[ch].as_mut_slice(ps)[i] = match state.audio_rx.try_recv() {
-                            Ok(sample) => sample,
-                            Err(e) => match e {
-                                TryRecvError::Empty => 0.0,
-                                TryRecvError::Disconnected => return jack::Control::Quit,
-                            },
+                        state.ports[ch].as_mut_slice(ps)[i] = match state.audio_rx.blocking_recv() {
+                            Some(sample) => sample,
+                            None => 0.0,
                         };
                     }
                 }
@@ -769,7 +825,12 @@ impl RxEventLoop {
         // generic
 
         spawn(async move {
-            let mut socket_buf = init_buffer(desc.rtp_buffer_size(), || 0u8);
+            let buf_size = desc.rtp_buffer_size();
+            log::debug!(
+                "RTP receiver buffer: {} frames",
+                desc.frames_per_link_offset_buffer()
+            );
+            let mut socket_buf = init_buffer(buf_size, || 0u8);
 
             let close = move |tx: Response<()>| async move {
                 if let Err(err) = active_client.deactivate() {

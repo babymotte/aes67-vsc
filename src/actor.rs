@@ -53,7 +53,7 @@ pub trait Actor {
     }
 }
 
-pub trait ActorApi {
+pub trait ActorApi: Clone {
     type Message;
     type Error;
 

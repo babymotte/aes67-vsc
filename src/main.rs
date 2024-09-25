@@ -22,6 +22,7 @@ use aes67_vsc::{
     ptp::PtpApi,
     rtp::{RtpRxApi, RtpTxApi},
     sap::SapApi,
+    status::StatusApi,
 };
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
@@ -94,8 +95,13 @@ async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
         .await
         .into_diagnostic()?;
 
+    // TODO get from config?
+    let wb_root_key = "aes67-vsc/status".to_owned();
+
+    let status = StatusApi::new(&subsys, wb.clone(), wb_root_key).into_diagnostic()?;
     let rtp_tx = RtpTxApi::new(&subsys).into_diagnostic()?;
-    let rtp_rx = RtpRxApi::new(&subsys, args.inputs, link_offset).into_diagnostic()?;
+    let rtp_rx =
+        RtpRxApi::new(&subsys, args.inputs, link_offset, status.clone()).into_diagnostic()?;
     let sap = SapApi::new(&subsys, wb.clone()).into_diagnostic()?;
     let ptp = PtpApi::new(&subsys).into_diagnostic()?;
 

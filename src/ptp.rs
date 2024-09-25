@@ -23,6 +23,7 @@ use miette::Result;
 use tokio::sync::{mpsc, oneshot};
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
 
+#[derive(Clone)]
 pub struct PtpApi {
     channel: mpsc::Sender<PtpFunction>,
 }

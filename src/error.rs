@@ -19,11 +19,16 @@ use std::io;
 
 use crate::{
     ptp::PtpFunction,
-    rtp::{rx::RxFunction, tx::TxFunction, ReceiverId, RxConfig, RxThreadFunction},
+    rtp::{rx::RxFunction, tx::TxFunction, RxConfig, RxThreadFunction},
     sap::SapFunction,
+    status::Status,
+    ReceiverId,
 };
 use thiserror::Error;
-use tokio::sync::{mpsc::error::SendError, oneshot::error::RecvError};
+use tokio::sync::{
+    mpsc::error::{SendError, TrySendError},
+    oneshot::error::RecvError,
+};
 
 #[derive(Error, Debug)]
 pub enum Aes67Error {
@@ -35,6 +40,8 @@ pub enum Aes67Error {
     SapError(#[from] SapError),
     #[error("ptp error: {0}")]
     PtpError(#[from] PtpError),
+    #[error("status error: {0}")]
+    StatusError(#[from] StatusError),
 }
 
 pub type Aes67Result<T> = Result<T, Aes67Error>;
@@ -73,6 +80,8 @@ pub enum RxError {
     InvalidLinkOffset(f32, f32),
     #[error("playout device not found: {0}")]
     NoPlayoutDevice(String),
+    #[error("status error: {0}")]
+    StatusError(#[from] StatusError),
 }
 
 pub type RxResult<T> = Result<T, RxError>;
@@ -101,3 +110,15 @@ pub enum PtpError {
 }
 
 pub type PtpResult<T> = Result<T, PtpError>;
+
+#[derive(Error, Debug)]
+pub enum StatusError {
+    #[error("error in worterbuch connection: {0}")]
+    WorterbuchError(#[from] worterbuch_client::ConnectionError),
+    #[error("channel error: {0}")]
+    SendError(#[from] SendError<Status>),
+    #[error("channel error: {0}")]
+    TrySendError(#[from] TrySendError<Status>),
+}
+
+pub type StatusResult<T> = Result<T, StatusError>;

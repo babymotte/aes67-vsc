@@ -20,4 +20,8 @@ pub mod error;
 pub mod ptp;
 pub mod rtp;
 pub mod sap;
+pub mod status;
 pub mod utils;
+
+pub type ReceiverId = usize;
+pub type TransmitterId = usize;

@@ -18,6 +18,7 @@
 use crate::{
     actor::{Actor, ActorApi},
     error::{RxError, TxError},
+    TransmitterId,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
@@ -64,8 +65,6 @@ impl RtpTxApi {
             .await
     }
 }
-
-pub(crate) type TransmitterId = String;
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct TxDescriptor {

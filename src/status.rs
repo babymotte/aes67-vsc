@@ -1,0 +1,260 @@
+/*
+ *  Copyright (C) 2024 Michael Bachmann
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU Affero General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU Affero General Public License for more details.
+ *
+ *  You should have received a copy of the GNU Affero General Public License
+ *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+use crate::{
+    actor::{Actor, ActorApi},
+    error::{StatusError, StatusResult},
+    rtp::RxDescriptor,
+    ReceiverId,
+};
+use serde_json::json;
+use std::net::SocketAddr;
+use tokio::sync::mpsc;
+use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
+use worterbuch_client::{topic, Value, Worterbuch};
+
+#[derive(Debug, Clone)]
+pub enum Status {
+    UsedInputChannels(usize, usize),
+    UsedOutputChannels(usize, usize),
+    UsedTransmitters(usize, usize),
+    UsedReceivers(usize, usize),
+    Receiver(Receiver),
+}
+
+pub enum Transmitter {
+    Sdp(ReceiverId, String),
+}
+
+#[derive(Debug, Clone)]
+pub enum Receiver {
+    Created(RxDescriptor),
+    Deleted(RxDescriptor),
+    LinkOffset(ReceiverId, usize),
+    MulticastAddress(ReceiverId, SocketAddr),
+    PacketTime(ReceiverId, usize),
+    SessionIdAndVersion(ReceiverId, u64, u64),
+    SessionName(ReceiverId, String),
+    Sdp(ReceiverId, String),
+    Meter(ReceiverId, usize, u16),
+    BufferUnderflow(ReceiverId, u64),
+    BufferOverflow(ReceiverId, u64),
+}
+
+#[derive(Clone)]
+pub struct StatusApi {
+    channel: mpsc::Sender<Status>,
+}
+
+impl ActorApi for StatusApi {
+    type Message = Status;
+    type Error = StatusError;
+
+    fn message_tx(&self) -> &mpsc::Sender<Self::Message> {
+        &self.channel
+    }
+}
+
+impl StatusApi {
+    pub fn new(subsys: &SubsystemHandle, wb: Worterbuch, root_key: String) -> StatusResult<Self> {
+        let (channel, commands) = mpsc::channel(1);
+
+        subsys.start(SubsystemBuilder::new("status", |s| async move {
+            let mut actor = StatusActor::new(commands, wb, root_key);
+            actor
+                .run("status".to_owned(), s.create_cancellation_token())
+                .await
+        }));
+
+        Ok(StatusApi { channel })
+    }
+
+    pub async fn publish(&self, status: Status) -> StatusResult<()> {
+        Ok(self.channel.send(status).await?)
+    }
+
+    pub fn publish_blocking(&self, status: Status) -> StatusResult<()> {
+        Ok(self.channel.blocking_send(status)?)
+    }
+
+    pub fn try_publish(&self, status: Status) -> StatusResult<()> {
+        Ok(self.channel.try_send(status)?)
+    }
+}
+
+struct StatusActor {
+    commands: mpsc::Receiver<Status>,
+    wb: Worterbuch,
+    root_key: String,
+}
+
+impl Actor for StatusActor {
+    type Message = Status;
+    type Error = StatusError;
+
+    async fn recv_message(&mut self) -> Option<Status> {
+        self.commands.recv().await
+    }
+
+    async fn process_message(&mut self, status: Status) -> bool {
+        let action = self.to_action(status);
+        match action {
+            Action::Set(kvps) => {
+                for (key, value) in kvps {
+                    if self
+                        .wb
+                        .set(topic!(self.root_key, key), value)
+                        .await
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+            }
+            Action::Publish(kvps) => {
+                for (key, value) in kvps {
+                    if self
+                        .wb
+                        .publish(topic!(self.root_key, key), &value)
+                        .await
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+            }
+            Action::Delete(keys) => {
+                for key in keys {
+                    if self
+                        .wb
+                        .pdelete::<Value>(topic!(self.root_key, key), true)
+                        .await
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
+enum Action {
+    Set(Vec<(String, Value)>),
+    Publish(Vec<(String, Value)>),
+    Delete(Vec<String>),
+}
+
+impl StatusActor {
+    fn new(commands: mpsc::Receiver<Status>, wb: Worterbuch, root_key: String) -> Self {
+        Self {
+            commands,
+            wb,
+            root_key,
+        }
+    }
+
+    fn to_action(&self, status: Status) -> Action {
+        match status {
+            Status::UsedInputChannels(used, max) => Action::Set(vec![
+                (topic!("resources", "inputChannels", "used"), json!(used)),
+                (topic!("resources", "inputChannels", "max"), json!(max)),
+            ]),
+            Status::UsedOutputChannels(used, max) => Action::Set(vec![
+                (topic!("resources", "outputChannels", "used"), json!(used)),
+                (topic!("resources", "outputChannels", "max"), json!(max)),
+            ]),
+            Status::UsedTransmitters(used, max) => Action::Set(vec![
+                (topic!("resources", "transmitters", "used"), json!(used)),
+                (topic!("resources", "transmitters", "max"), json!(max)),
+            ]),
+            Status::UsedReceivers(used, max) => Action::Set(vec![
+                (topic!("resources", "receivers", "used"), json!(used)),
+                (topic!("resources", "receivers", "max"), json!(max)),
+            ]),
+            Status::Receiver(receiver) => match receiver {
+                Receiver::Created(desc) => Action::Set(vec![
+                    (
+                        topic!("receivers", desc.id, "bitDepth"),
+                        json!(desc.bit_depth),
+                    ),
+                    (
+                        topic!("receivers", desc.id, "channels"),
+                        json!(desc.channels),
+                    ),
+                    (
+                        topic!("receivers", desc.id, "packetTimeMs"),
+                        json!(desc.packet_time),
+                    ),
+                    (
+                        topic!("receivers", desc.id, "sampleRate"),
+                        json!(desc.sampling_rate),
+                    ),
+                    (
+                        topic!("receivers", desc.id, "session", "id"),
+                        json!(desc.session_id),
+                    ),
+                    (
+                        topic!("receivers", desc.id, "session", "version"),
+                        json!(desc.session_version),
+                    ),
+                    (
+                        topic!("receivers", desc.id, "session", "name"),
+                        json!(desc.session_name),
+                    ),
+                ]),
+                Receiver::Deleted(desc) => Action::Delete(vec![topic!("receivers", desc.id, "#")]),
+                Receiver::LinkOffset(id, value) => Action::Set(vec![(
+                    topic!("receivers", id, "linkOffsetMs"),
+                    json!(value),
+                )]),
+                Receiver::MulticastAddress(id, value) => Action::Set(vec![(
+                    topic!("receivers", id, "multicastAddress"),
+                    json!(value),
+                )]),
+                Receiver::PacketTime(id, value) => Action::Set(vec![(
+                    topic!("receivers", id, "packetTimeMs"),
+                    json!(value),
+                )]),
+                Receiver::SessionIdAndVersion(id, value1, value2) => Action::Set(vec![
+                    (topic!("receivers", id, "session", "id"), json!(value1)),
+                    (topic!("receivers", id, "session", "version"), json!(value2)),
+                ]),
+                Receiver::SessionName(id, value) => Action::Set(vec![(
+                    topic!("receivers", id, "session", "name"),
+                    json!(value),
+                )]),
+                Receiver::Sdp(id, value) => {
+                    Action::Set(vec![(topic!("receivers", id, "sdp"), json!(value))])
+                }
+                Receiver::Meter(id, channel, value) => Action::Set(vec![(
+                    topic!("receivers", id, "meter", channel),
+                    json!(value),
+                )]),
+                Receiver::BufferUnderflow(id, value) => Action::Set(vec![(
+                    topic!("receivers", id, "buffer", "underflow"),
+                    json!(value),
+                )]),
+                Receiver::BufferOverflow(id, value) => Action::Set(vec![(
+                    topic!("receivers", id, "buffer", "overflow"),
+                    json!(value),
+                )]),
+            },
+        }
+    }
+}
