@@ -41,7 +41,7 @@ use tokio::sync::{
 };
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
 use tower_http::services::{ServeDir, ServeFile};
-use worterbuch_client::Worterbuch;
+use worterbuch_client::{config::Config, Worterbuch};
 
 #[derive(Error, Debug)]
 enum UiError {
@@ -115,6 +115,7 @@ pub async fn ui(
     sap: SapApi,
     port: u16,
     wb: Worterbuch,
+    wb_cfg: Config,
 ) -> Result<()> {
     subsys.start(SubsystemBuilder::new("ui", move |s| async move {
         let webapp_root_dir =
@@ -129,7 +130,7 @@ pub async fn ui(
         }
 
         let (channel, ui_commands) = mpsc::channel(1000);
-        let ui_api = UiApi { channel };
+        let ui_api = UiApi { channel, wb_cfg };
 
         s.start(SubsystemBuilder::new("web-server", move |s| async move {
             let serve_dir = ServeDir::new(&webapp_root_dir)
@@ -189,6 +190,7 @@ enum UiFunction {
 #[derive(Debug, Clone)]
 struct UiApi {
     channel: mpsc::Sender<UiFunction>,
+    wb_cfg: Config,
 }
 
 impl ActorApi for UiApi {
@@ -214,6 +216,23 @@ impl UiApi {
     async fn delete_receiver(&self, receiver: usize) -> Result<(), UiError> {
         self.send_message(|tx| UiFunction::DeleteReceiver(receiver, tx))
             .await
+    }
+
+    async fn wb_config_for_web(&self) -> WorterbuchConfig {
+        let Config {
+            host_addr,
+            auth_token,
+            ..
+        } = self.wb_cfg.clone();
+
+        WorterbuchConfig {
+            backend_scheme: "ws".to_owned(),
+            backend_host: host_addr,
+            // TODO use port from config
+            backend_port: Some(80),
+            backend_path: "/ws".to_owned(),
+            backend_auth_token: auth_token,
+        }
     }
 }
 
@@ -281,7 +300,7 @@ async fn delete_receiver(
     }
 
     (
-        StatusCode::CREATED,
+        StatusCode::OK,
         Json(ReceiverDeleted {
             result: Some("OK".to_owned()),
             error: None,
@@ -289,15 +308,9 @@ async fn delete_receiver(
     )
 }
 
-async fn wb_config() -> impl IntoResponse {
-    // TODO load from config
-    Json(WorterbuchConfig {
-        backend_scheme: "ws".to_owned(),
-        backend_host: "localhost".to_owned(),
-        backend_port: Some(8080),
-        backend_path: "/ws".to_owned(),
-        backend_auth_token: None,
-    })
+async fn wb_config(State(ui_api): State<UiApi>) -> impl IntoResponse {
+    let config = ui_api.wb_config_for_web().await;
+    Json(config)
 }
 
 #[derive(Deserialize)]

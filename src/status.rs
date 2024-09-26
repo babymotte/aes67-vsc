@@ -42,7 +42,7 @@ pub enum Transmitter {
 
 #[derive(Debug, Clone)]
 pub enum Receiver {
-    Created(RxDescriptor),
+    Created(RxDescriptor, Option<String>),
     Deleted(RxDescriptor),
     LinkOffset(ReceiverId, usize),
     MulticastAddress(ReceiverId, SocketAddr),
@@ -188,37 +188,59 @@ impl StatusActor {
                 (topic!("resources", "receivers", "max"), json!(max)),
             ]),
             Status::Receiver(receiver) => match receiver {
-                Receiver::Created(desc) => Action::Set(vec![
-                    (
-                        topic!("receivers", desc.id, "bitDepth"),
-                        json!(desc.bit_depth),
-                    ),
-                    (
-                        topic!("receivers", desc.id, "channels"),
-                        json!(desc.channels),
-                    ),
-                    (
-                        topic!("receivers", desc.id, "packetTimeMs"),
-                        json!(desc.packet_time),
-                    ),
-                    (
-                        topic!("receivers", desc.id, "sampleRate"),
-                        json!(desc.sampling_rate),
-                    ),
-                    (
-                        topic!("receivers", desc.id, "session", "id"),
-                        json!(desc.session_id),
-                    ),
-                    (
-                        topic!("receivers", desc.id, "session", "version"),
-                        json!(desc.session_version),
-                    ),
-                    (
-                        topic!("receivers", desc.id, "session", "name"),
-                        json!(desc.session_name),
-                    ),
+                Receiver::Created(desc, sdp) => {
+                    let mut vec = vec![
+                        (
+                            topic!("receivers", desc.id, "bitDepth"),
+                            json!(desc.bit_depth),
+                        ),
+                        (
+                            topic!("receivers", desc.id, "channels"),
+                            json!(desc.channels),
+                        ),
+                        (
+                            topic!("receivers", desc.id, "packetTimeMs"),
+                            json!(desc.packet_time),
+                        ),
+                        (
+                            topic!("receivers", desc.id, "sampleRate"),
+                            json!(desc.sampling_rate),
+                        ),
+                        (
+                            topic!("receivers", desc.id, "session", "id"),
+                            json!(desc.session_id),
+                        ),
+                        (
+                            topic!("receivers", desc.id, "session", "version"),
+                            json!(desc.session_version),
+                        ),
+                        (
+                            topic!("receivers", desc.id, "session", "name"),
+                            json!(desc.session_name),
+                        ),
+                        (
+                            topic!("sessions", desc.session_id, desc.session_version, "name"),
+                            json!(desc.session_name),
+                        ),
+                        (
+                            topic!(
+                                "sessions",
+                                desc.session_id,
+                                desc.session_version,
+                                "receiver"
+                            ),
+                            json!(desc.id),
+                        ),
+                    ];
+                    if let Some(sdp) = sdp {
+                        vec.push((topic!("receivers", desc.id, "sdp"), json!(sdp)));
+                    }
+                    Action::Set(vec)
+                }
+                Receiver::Deleted(desc) => Action::Delete(vec![
+                    topic!("receivers", desc.id, "#"),
+                    topic!("sessions", desc.session_id, "#"),
                 ]),
-                Receiver::Deleted(desc) => Action::Delete(vec![topic!("receivers", desc.id, "#")]),
                 Receiver::LinkOffset(id, value) => Action::Set(vec![(
                     topic!("receivers", id, "linkOffsetMs"),
                     json!(value),

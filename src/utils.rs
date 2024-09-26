@@ -82,7 +82,8 @@ impl<'a> InconsistentRtpIterator<'a> {
         let mut seq_max = Seq::from(0);
 
         let first = RtpReader::new(&buffer[0..packet_len])?;
-        let might_wrap = u16::from(first.sequence_number()) > u16::MAX - 2 * buffer.len() as u16;
+        let might_wrap =
+            u16::from(first.sequence_number()) as usize > u16::MAX as usize - 2 * buffer.len();
 
         for chunk in buffer.chunks(packet_len) {
             let rtp = RtpReader::new(chunk)?;
@@ -123,8 +124,6 @@ impl<'a> Iterator for InconsistentRtpIterator<'a> {
     type Item = RtpReader<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        return None;
-
         let start = self.current;
         self.current = start + self.packet_len;
 
@@ -144,7 +143,7 @@ impl<'a> Iterator for InconsistentRtpIterator<'a> {
                 Some(item)
             } else {
                 let next = self.next();
-                self.current -= 2 * self.packet_len;
+                self.current = (self.current as i32 - 2 * self.packet_len as i32).max(0) as usize;
                 next
             }
         } else {

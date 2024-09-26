@@ -34,7 +34,7 @@ use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle, Toplevel};
 use tracing_log::AsTrace;
 use tracing_subscriber::EnvFilter;
 use ui::ui;
-use worterbuch_client::connect_with_default_config;
+use worterbuch_client::{connect_with_default_config, topic};
 
 #[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
 #[global_allocator]
@@ -91,21 +91,27 @@ async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
         log::info!("Worterbuch disconnected, requesting shutdown.");
         wb_disco.send(()).ok();
     };
-    let (wb, _) = connect_with_default_config(on_disconnect)
+    let (wb, wb_cfg) = connect_with_default_config(on_disconnect)
         .await
         .into_diagnostic()?;
 
     // TODO get from config?
-    let wb_root_key = "aes67-vsc/status".to_owned();
+    let wb_root_key = "aes67-vsc".to_owned();
 
-    let status = StatusApi::new(&subsys, wb.clone(), wb_root_key).into_diagnostic()?;
+    wb.set_client_name(&wb_root_key).await.into_diagnostic()?;
+    wb.set_grave_goods(&[&topic!(wb_root_key, "status", "#")])
+        .await
+        .into_diagnostic()?;
+
+    let status =
+        StatusApi::new(&subsys, wb.clone(), wb_root_key.clone() + "/status").into_diagnostic()?;
     let rtp_tx = RtpTxApi::new(&subsys).into_diagnostic()?;
     let rtp_rx =
         RtpRxApi::new(&subsys, args.inputs, link_offset, status.clone()).into_diagnostic()?;
-    let sap = SapApi::new(&subsys, wb.clone()).into_diagnostic()?;
+    let sap = SapApi::new(&subsys, wb.clone(), wb_root_key.clone()).into_diagnostic()?;
     let ptp = PtpApi::new(&subsys).into_diagnostic()?;
 
-    ui(&subsys, rtp_tx, rtp_rx, ptp, sap, port, wb.clone()).await?;
+    ui(&subsys, rtp_tx, rtp_rx, ptp, sap, port, wb.clone(), wb_cfg).await?;
 
     select! {
         _ = subsys.on_shutdown_requested() => (),

@@ -19,6 +19,8 @@ import axios from "axios";
 import React from "react";
 import { Config } from "worterbuch-react";
 
+export const WB_ROOT_KEY = "aes67-vsc";
+
 export function useWbConfig(): [Config | undefined, string | undefined] {
   const [config, setConfig] = React.useState<Config | undefined>();
   const [error, setError] = React.useState<string | undefined>();
@@ -66,9 +68,9 @@ export function useReceiveStream(
         axios
           .post("/api/v1/receive/stream", { sdp })
           .then((resp) => {
-            const { sessionId, error } = resp.data;
-            if (sessionId) {
-              res(sessionId);
+            const { result, error } = resp.data;
+            if (result) {
+              res(result);
             } else if (error) {
               rej(new Error(error));
             }
@@ -77,5 +79,22 @@ export function useReceiveStream(
       } else {
         rej(new Error("SDP is empty"));
       }
+    });
+}
+
+export function useDeleteReceiver(receiver: number): () => Promise<string> {
+  return () =>
+    new Promise((res, rej) => {
+      axios
+        .post("/api/v1/delete/receiver", { receiver })
+        .then((resp) => {
+          const { result, error } = resp.data;
+          if (result) {
+            res(result);
+          } else if (error) {
+            rej(new Error(error));
+          }
+        })
+        .catch((e) => rej(new Error(e.message)));
     });
 }

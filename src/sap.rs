@@ -44,13 +44,17 @@ impl ActorApi for SapApi {
 }
 
 impl SapApi {
-    pub fn new(subsys: &SubsystemHandle, wb: Worterbuch) -> Result<Self, SapError> {
+    pub fn new(
+        subsys: &SubsystemHandle,
+        wb: Worterbuch,
+        root_key: String,
+    ) -> Result<Self, SapError> {
         let (channel, messages) = mpsc::channel(1);
 
         subsys.start(SubsystemBuilder::new("sap", |s| async move {
             let token = s.create_cancellation_token();
             let mut actor = SapActor::new(s, messages, wb.clone());
-            actor.start_discovery(wb.clone()).await?;
+            actor.start_discovery(wb.clone(), root_key).await?;
             actor.run("sap".to_owned(), token).await
         }));
 
@@ -111,7 +115,7 @@ impl SapActor {
         }
     }
 
-    async fn start_discovery(&mut self, wb: Worterbuch) -> Result<(), SapError> {
+    async fn start_discovery(&mut self, wb: Worterbuch, root_key: String) -> Result<(), SapError> {
         log::info!("Starting SAP discovery …");
         let sap = Sap::new().await?;
         self.subsys
@@ -126,7 +130,7 @@ impl SapActor {
                                 Ok(sa) => {
                                     // TODO use customized key?
                                     log::info!("Received SAP announcement …");
-                                    let key = topic!("aes67-vsc/discovery/sap", sa.originating_source.to_string(), sa.msg_id_hash);
+                                    let key = topic!(root_key, "discovery", "sap", sa.originating_source.to_string(), sa.msg_id_hash);
                                     if sa.deletion {
                                         log::debug!("SDP {} was deleted by {}.", sa.msg_id_hash, sa.originating_source);
                                         wb.delete::<String>(key).await?;

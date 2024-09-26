@@ -38,10 +38,7 @@ use std::{
 use tokio::{
     net::UdpSocket,
     runtime, select, spawn,
-    sync::{
-        mpsc::{self, error::TryRecvError},
-        oneshot,
-    },
+    sync::{mpsc, oneshot},
 };
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
 use tokio_util::sync::CancellationToken;
@@ -421,7 +418,10 @@ impl RtpRxActor {
         self.active_receivers[receiver_id] = Some(session_id);
         self.used_channels += desc.channels;
         self.status
-            .publish(Status::Receiver(Receiver::Created(desc.clone())))
+            .publish(Status::Receiver(Receiver::Created(
+                desc.clone(),
+                Some(sdp.marshal()),
+            )))
             .await?;
         log::info!("Receiver {receiver_id} created.");
         self.log_channel_consumption().await?;
@@ -572,9 +572,6 @@ async fn create_rx_socket(sdp: &SessionDescription) -> Result<UdpSocket, RxError
         IpAddr::V4(ipv4_addr) => create_ipv4_socket(ipv4_addr, port)?,
         IpAddr::V6(ipv6_addr) => create_ipv6_socket(ipv6_addr, port)?,
     };
-    socket.set_reuse_address(true)?;
-    socket.set_reuse_port(true)?;
-    socket.set_nonblocking(true)?;
 
     let tokio_socket = UdpSocket::from_std(socket.into())?;
 
@@ -601,6 +598,11 @@ fn create_ipv4_socket(ip_addr: Ipv4Addr, port: u16) -> Result<Socket, RxError> {
     let local_addr = SocketAddr::new(IpAddr::V4(local_ip), port);
 
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+
+    socket.set_reuse_address(true)?;
+    socket.set_reuse_port(true)?;
+    socket.set_nonblocking(true)?;
+
     socket.bind(&SockAddr::from(local_addr))?;
     if ip_addr.is_multicast() {
         socket.join_multicast_v4(&ip_addr, &local_ip)?
@@ -628,6 +630,11 @@ fn create_ipv6_socket(ip_addr: Ipv6Addr, port: u16) -> Result<Socket, RxError> {
     let local_addr = SocketAddr::new(IpAddr::V6(local_ip), port);
 
     let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+
+    socket.set_reuse_address(true)?;
+    socket.set_reuse_port(true)?;
+    socket.set_nonblocking(true)?;
+
     socket.bind(&SockAddr::from(local_addr))?;
     if ip_addr.is_multicast() {
         socket.join_multicast_v6(&ip_addr, 0)?
@@ -750,13 +757,21 @@ impl RxEventLoop {
         // JACK specific
 
         // 1. open a client
+        let client_name = format!(
+            "{}-{}-{}",
+            desc.session_name, desc.session_id, desc.session_version
+        );
         let (client, _status) =
-            jack::Client::new(&desc.session_name, jack::ClientOptions::default()).unwrap();
+            jack::Client::new(&client_name, jack::ClientOptions::default()).unwrap();
 
         let spec = jack::AudioOut::default();
 
         let ports: Vec<Port<AudioOut>> = (0..desc.channels)
-            .map(|i| client.register_port(&(i + 1).to_string(), spec).unwrap())
+            .map(|i| {
+                client
+                    .register_port(&format!("out{}", i + 1), spec)
+                    .unwrap()
+            })
             .collect();
 
         // 3. define process callback handler
@@ -794,9 +809,9 @@ impl RxEventLoop {
 
                 for i in 0..buffer_size {
                     for ch in 0..channels {
-                        state.ports[ch].as_mut_slice(ps)[i] = match state.audio_rx.blocking_recv() {
-                            Some(sample) => sample,
-                            None => 0.0,
+                        state.ports[ch].as_mut_slice(ps)[i] = match state.audio_rx.try_recv() {
+                            Ok(sample) => sample,
+                            Err(_) => 0.0,
                         };
                     }
                 }
