@@ -12,7 +12,7 @@ import VolumeUpIcon from "@mui/icons-material/VolumeUp";
 import { useDeleteReceiver, useReceiveStream, WB_ROOT_KEY } from "../../api";
 
 export default function DiscoveryList() {
-  const sdps = usePSubscribe<string>(WB_ROOT_KEY + "/discovery/#");
+  const sdps = usePSubscribe<string>(WB_ROOT_KEY + "/discovery/?/?/?/sdp");
   const listItems: React.JSX.Element[] = [];
 
   sdps.forEach((v, k) => {

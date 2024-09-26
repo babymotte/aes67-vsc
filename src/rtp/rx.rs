@@ -33,11 +33,10 @@ use std::{
     collections::HashMap,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    thread,
 };
 use tokio::{
     net::UdpSocket,
-    runtime, select, spawn,
+    select, spawn,
     sync::{mpsc, oneshot},
 };
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
@@ -175,36 +174,35 @@ impl RxDescriptor {
     }
 }
 
-#[derive(Debug)]
-enum Dealloc {
-    Socket(Socket),
-    RxDescriptor(RxDescriptor),
-}
+// #[derive(Debug)]
+// enum Dealloc {
+//     Socket(Socket),
+//     RxDescriptor(RxDescriptor),
+// }
 
-#[derive(Debug)]
-enum RxThreadEvent {
-    BufferOverflow(ReceiverId),
-    BufferUnderflow(ReceiverId),
-    ThreadStopped,
-    Err(RxError),
-    Dealloc(Dealloc),
-}
-
+// #[derive(Debug)]
+// enum RxThreadEvent {
+//     BufferOverflow(ReceiverId),
+//     BufferUnderflow(ReceiverId),
+//     ThreadStopped,
+//     Err(RxError),
+//     Dealloc(Dealloc),
+// }
 #[derive(Debug)]
 pub enum RxThreadFunction {
     StartReceiver(ReceiverId, RxDescriptor, UdpSocket, Response<()>),
     StopReceiver(ReceiverId, Response<()>),
 }
 
-struct RxThreadDestructor {
-    event_tx: mpsc::UnboundedSender<RxThreadEvent>,
-}
+// struct RxThreadDestructor {
+//     event_tx: mpsc::UnboundedSender<RxThreadEvent>,
+// }
 
-impl Drop for RxThreadDestructor {
-    fn drop(&mut self) {
-        self.event_tx.send(RxThreadEvent::ThreadStopped).ok();
-    }
-}
+// impl Drop for RxThreadDestructor {
+//     fn drop(&mut self) {
+//         self.event_tx.send(RxThreadEvent::ThreadStopped).ok();
+//     }
+// }
 
 #[derive(Clone)]
 pub struct RtpRxApi {
@@ -229,37 +227,12 @@ impl RtpRxApi {
     ) -> Result<Self, RxError> {
         let (channel, commands) = mpsc::channel(1);
 
-        let (rx_thread_function_tx, rx_thread_function_rx) = mpsc::channel(1);
-        let (rx_thread_event_tx, rx_thread_event_rx) = mpsc::unbounded_channel();
-        let (stop_tx, stop_rx) = oneshot::channel();
-
-        let rx_st = status.clone();
-        thread::Builder::new()
-            .name("rx-thread".to_string())
-            .spawn(move || {
-                rx_thread(
-                    rx_thread_function_rx,
-                    rx_thread_event_tx,
-                    stop_rx,
-                    max_channels,
-                    rx_st,
-                )
-            })?;
-
         subsys.start(SubsystemBuilder::new("rtp/rx", move |s| async move {
-            let mut actor = RtpRxActor::new(
-                commands,
-                rx_thread_function_tx,
-                rx_thread_event_rx,
-                max_channels,
-                link_offset,
-                status,
-            );
+            let mut actor = RtpRxActor::new(commands, max_channels, link_offset, status);
             actor.log_channel_consumption().await?;
             let res = actor
                 .run("rtp-rx".to_owned(), s.create_cancellation_token())
                 .await;
-            stop_tx.send(()).ok();
             log::info!("RX thread terminated.");
             s.request_shutdown();
             res
@@ -296,12 +269,12 @@ struct RtpRxActor {
     commands: mpsc::Receiver<RxFunction>,
     receiver_ids: HashMap<String, RxDescriptor>,
     active_receivers: Vec<Option<String>>,
-    rx_thread_function_tx: mpsc::Sender<RxThreadFunction>,
-    rx_thread_event_rx: mpsc::UnboundedReceiver<RxThreadEvent>,
     max_channels: usize,
     used_channels: usize,
     link_offset: f32,
     status: StatusApi,
+    playout_streams: Box<[Option<oneshot::Sender<Response<()>>>]>,
+    rx_descriptors: Box<[Option<RxDescriptor>]>,
 }
 
 impl Actor for RtpRxActor {
@@ -329,9 +302,9 @@ impl Actor for RtpRxActor {
                 Some(msg) = self.commands.recv() => if !self.process_message(msg).await {
                     break;
                 },
-                Some(e) = self.rx_thread_event_rx.recv() =>  if !self.process_event(e).await {
-                    break;
-                },
+                // Some(e) = self.rx_thread_event_rx.recv() =>  if !self.process_event(e).await {
+                //     break;
+                // },
                 else => break,
             }
         }
@@ -343,42 +316,43 @@ impl Actor for RtpRxActor {
 impl RtpRxActor {
     fn new(
         commands: mpsc::Receiver<RxFunction>,
-        rx_thread_function_tx: mpsc::Sender<RxThreadFunction>,
-        rx_thread_event_rx: mpsc::UnboundedReceiver<RxThreadEvent>,
         max_channels: usize,
         link_offset: f32,
         status: StatusApi,
     ) -> Self {
         let receiver_ids = HashMap::new();
         let active_receivers = vec![None; max_channels];
+        let playout_streams = init_buffer(max_channels, || None);
+        let rx_descriptors = init_buffer(max_channels, || None);
+
         RtpRxActor {
             commands,
             receiver_ids,
             active_receivers,
-            rx_thread_function_tx,
-            rx_thread_event_rx,
             max_channels,
             used_channels: 0,
             link_offset,
             status,
+            playout_streams,
+            rx_descriptors,
         }
     }
 
-    async fn process_event(&mut self, event: RxThreadEvent) -> bool {
-        match event {
-            RxThreadEvent::BufferOverflow(_) => todo!(),
-            RxThreadEvent::BufferUnderflow(_) => todo!(),
-            RxThreadEvent::ThreadStopped => false,
-            RxThreadEvent::Err(e) => {
-                log::error!("Error in receiver thread: {e}");
-                false
-            }
-            RxThreadEvent::Dealloc(it) => {
-                drop(it);
-                true
-            }
-        }
-    }
+    // async fn process_event(&mut self, event: RxThreadEvent) -> bool {
+    //     match event {
+    //         RxThreadEvent::BufferOverflow(_) => todo!(),
+    //         RxThreadEvent::BufferUnderflow(_) => todo!(),
+    //         RxThreadEvent::ThreadStopped => false,
+    //         RxThreadEvent::Err(e) => {
+    //             log::error!("Error in receiver thread: {e}");
+    //             false
+    //         }
+    //         RxThreadEvent::Dealloc(it) => {
+    //             drop(it);
+    //             true
+    //         }
+    //     }
+    // }
 
     async fn create_receiver(&mut self, sdp: SessionDescription) -> RxResult<()> {
         let session_id = session_id(&sdp);
@@ -404,16 +378,16 @@ impl RtpRxActor {
         }
         log::info!("Creating receiver '{receiver_id}' for session '{session_id}' …",);
         let socket = create_rx_socket(&sdp).await?;
-        let (tx, rx) = oneshot::channel();
-        self.rx_thread_function_tx
-            .send(RxThreadFunction::StartReceiver(
-                receiver_id,
-                desc.clone(),
-                socket,
-                tx,
-            ))
-            .await?;
-        rx.await??;
+
+        self.rx_descriptors[receiver_id] = Some(desc.clone());
+        let (control_tx, control_rx) = oneshot::channel();
+        let status = self.status.clone();
+        let po_desc = desc.clone();
+
+        playout_stream(socket, po_desc, control_rx, status).await?;
+
+        self.playout_streams[receiver_id] = Some(control_tx);
+
         self.receiver_ids.insert(session_id.clone(), desc.clone());
         self.active_receivers[receiver_id] = Some(session_id);
         self.used_channels += desc.channels;
@@ -425,6 +399,7 @@ impl RtpRxActor {
             .await?;
         log::info!("Receiver {receiver_id} created.");
         self.log_channel_consumption().await?;
+
         Ok(())
     }
 
@@ -443,11 +418,11 @@ impl RtpRxActor {
 
         if let Some(desc) = self.receiver_ids.remove(&session_id) {
             self.used_channels -= desc.channels;
-            let (tx, rx) = oneshot::channel();
-            self.rx_thread_function_tx
-                .send(RxThreadFunction::StopReceiver(receiver_id, tx))
-                .await?;
-            rx.await??;
+
+            log::info!("Stopping receiver '{receiver_id}' …");
+            drop(self.rx_descriptors[receiver_id].take());
+            drop(self.playout_streams[receiver_id].take());
+
             self.status
                 .publish(Status::Receiver(Receiver::Deleted(desc.clone())))
                 .await?;
@@ -547,11 +522,7 @@ async fn create_rx_socket(sdp: &SessionDescription) -> Result<UdpSocket, RxError
         )));
     }
 
-    let Address {
-        address,
-        range,
-        ttl,
-    } = address;
+    let Address { address, .. } = address;
 
     // TODO for unicast addresses check if the IP exists on this machine and reject otherwise
     // TODO for IPv4 check if the TTL allows packets to reach this machine and reject otherwise
@@ -559,7 +530,7 @@ async fn create_rx_socket(sdp: &SessionDescription) -> Result<UdpSocket, RxError
     let mut split = address.split('/');
     let ip = split.next();
     let prefix = split.next();
-    let ip_addr: IpAddr = if let (Some(ip), Some(prefix)) = (ip, prefix) {
+    let ip_addr: IpAddr = if let (Some(ip), Some(_prefix)) = (ip, prefix) {
         ip.parse()
             .map_err(|_| RxError::InvalidSdp(format!("invalid ip address: {address}")))?
     } else {
@@ -642,291 +613,191 @@ fn create_ipv6_socket(ip_addr: Ipv6Addr, port: u16) -> Result<Socket, RxError> {
     Ok(socket)
 }
 
-fn rx_thread(
-    fun_rx: mpsc::Receiver<RxThreadFunction>,
-    event_tx: mpsc::UnboundedSender<RxThreadEvent>,
-    stop_rx: oneshot::Receiver<()>,
-    max_channels: usize,
+async fn playout_stream(
+    socket: UdpSocket,
+    desc: RxDescriptor,
+    mut control_rx: oneshot::Receiver<Response<()>>,
     status: StatusApi,
 ) -> RxResult<()> {
-    // makes sure a 'thread stopped' event is sent out even in the event of a panic
-    let destructor = RxThreadDestructor {
-        event_tx: event_tx.clone(),
-    };
-    let rt = runtime::Builder::new_current_thread().build()?;
-    let res =
-        rt.block_on(RxEventLoop::new(event_tx.clone(), max_channels, status).run(fun_rx, stop_rx));
-    drop(destructor);
-    res
-}
+    // init
 
-struct RxEventLoop {
-    playout_streams: Box<[Option<oneshot::Sender<Response<()>>>]>,
-    rx_descriptors: Box<[Option<RxDescriptor>]>,
-    event_tx: mpsc::UnboundedSender<RxThreadEvent>,
-    status: StatusApi,
-}
+    let rtp_packet_size = desc.rtp_packet_size();
+    let bytes_per_sample = desc.bytes_per_sample();
 
-impl RxEventLoop {
-    fn new(
-        event_tx: mpsc::UnboundedSender<RxThreadEvent>,
-        max_channels: usize,
-        status: StatusApi,
-    ) -> Self {
-        let playout_streams = init_buffer(max_channels, || None);
-        let rx_descriptors = init_buffer(max_channels, || None);
+    let (audio_tx, audio_rx) = mpsc::channel(desc.rtp_buffer_size());
 
-        RxEventLoop {
-            playout_streams,
-            rx_descriptors,
-            event_tx,
-            status,
-        }
-    }
+    // JACK specific
 
-    async fn run(
-        mut self,
-        mut fun_rx: mpsc::Receiver<RxThreadFunction>,
-        mut stop_rx: oneshot::Receiver<()>,
-    ) -> RxResult<()> {
-        loop {
-            select! {
-                _ = &mut stop_rx => break,
-                Some(fun) = fun_rx.recv() =>  {
-                    match fun {
-                        RxThreadFunction::StartReceiver(index, desc,socket, tx) => {
-                            self.start_receiver(index, desc, socket, tx);
-                        },
-                        RxThreadFunction::StopReceiver(index, tx) => {
-                            self.stop_receiver(index, tx);
-                        },
-                    }
-                },
-                else => break,
-            }
-        }
-        Ok(())
-    }
+    // 1. open a client
+    let client_name = format!(
+        "{}-{}-{}",
+        desc.session_name, desc.session_id, desc.session_version
+    );
+    let (client, _status) =
+        jack::Client::new(&client_name, jack::ClientOptions::default()).unwrap();
 
-    fn start_receiver(
-        &mut self,
-        index: usize,
+    let spec = jack::AudioOut::default();
+
+    let ports: Vec<Port<AudioOut>> = (0..desc.channels)
+        .map(|i| {
+            client
+                .register_port(&format!("out{}", i + 1), spec)
+                .unwrap()
+        })
+        .collect();
+
+    // 3. define process callback handler
+    struct State {
+        ports: Vec<Port<AudioOut>>,
+        audio_rx: mpsc::Receiver<f32>,
+        buf_size: usize,
         desc: RxDescriptor,
-        socket: UdpSocket,
-        tx: Response<()>,
-    ) {
-        self.rx_descriptors[index] = Some(desc.clone());
-        let (control_tx, control_rx) = oneshot::channel();
-        let status = self.status.clone();
-        spawn(async move {
-            if let Err(e) = Self::playout_stream(socket, desc, control_rx, status).await {
-                log::error!("Error playing out receiver stream: {e}");
-                tx.send(Err(e)).ok();
+        status: StatusApi,
+    }
+
+    let process = jack::contrib::ClosureProcessHandler::with_state(
+        State {
+            ports,
+            audio_rx,
+            buf_size: 0,
+            desc: desc.clone(),
+            status,
+        },
+        |state, _, ps| -> jack::Control {
+            // Get output buffer
+            let channels = state.ports.len();
+            let buffer_size = state.ports[0].as_mut_slice(ps).len();
+
+            if state.buf_size != buffer_size {
+                state.buf_size = buffer_size;
+                state
+                    .status
+                    .publish_blocking(Status::Receiver(Receiver::LinkOffset(
+                        state.desc.id,
+                        state.desc.to_link_offset(buffer_size),
+                    )))
+                    .ok();
+            }
+
+            for i in 0..buffer_size {
+                for ch in 0..channels {
+                    state.ports[ch].as_mut_slice(ps)[i] = match state.audio_rx.try_recv() {
+                        Ok(sample) => sample,
+                        Err(_) => 0.0,
+                    };
+                }
+            }
+
+            // Continue as normal
+            jack::Control::Continue
+        },
+        move |_, _, _| jack::Control::Continue,
+    );
+
+    // 4. Activate the client
+    let active_client = client.activate_async((), process).unwrap();
+
+    // connect the ports to the system audio.
+
+    // for ch in (1..desc.channels + 1).take(2) {
+    //     active_client
+    //         .as_client()
+    //         .connect_ports_by_name(
+    //             &format!("{}:{}", desc.session_name, ch),
+    //             &format!("REAPER:in{}", ch),
+    //         )
+    //         .unwrap();
+    // }
+
+    // generic
+
+    spawn(async move {
+        let buf_size = desc.rtp_buffer_size();
+        log::debug!(
+            "RTP receiver buffer: {} frames",
+            desc.frames_per_link_offset_buffer()
+        );
+        let mut socket_buf = init_buffer(buf_size, || 0u8);
+
+        let close = move |tx: Response<()>| async move {
+            if let Err(err) = active_client.deactivate() {
+                tx.send(Err(RxError::IoError(io::Error::new(
+                    io::ErrorKind::Other,
+                    err,
+                ))))
+                .ok();
             } else {
                 tx.send(Ok(())).ok();
             }
-        });
+        };
 
-        self.playout_streams[index] = Some(control_tx);
-    }
-
-    fn stop_receiver(&mut self, index: usize, tx: Response<()>) {
-        log::info!("Stopping receiver '{index}' …");
-        drop(self.rx_descriptors[index].take());
-        if let Some(ctrl_tx) = self.playout_streams[index].take() {
-            ctrl_tx.send(tx).ok();
-        } else {
-            log::warn!("Playout stream for receiver '{index}' does not exist.");
-            tx.send(Ok(())).ok();
-        }
-    }
-
-    async fn playout_stream(
-        socket: UdpSocket,
-        desc: RxDescriptor,
-        mut control_rx: oneshot::Receiver<Response<()>>,
-        status: StatusApi,
-    ) -> RxResult<()> {
-        // init
-
-        let rtp_packet_size = desc.rtp_packet_size();
-        let bytes_per_sample = desc.bytes_per_sample();
-
-        let (audio_tx, audio_rx) = mpsc::channel(desc.rtp_buffer_size());
-
-        // JACK specific
-
-        // 1. open a client
-        let client_name = format!(
-            "{}-{}-{}",
-            desc.session_name, desc.session_id, desc.session_version
-        );
-        let (client, _status) =
-            jack::Client::new(&client_name, jack::ClientOptions::default()).unwrap();
-
-        let spec = jack::AudioOut::default();
-
-        let ports: Vec<Port<AudioOut>> = (0..desc.channels)
-            .map(|i| {
-                client
-                    .register_port(&format!("out{}", i + 1), spec)
-                    .unwrap()
-            })
-            .collect();
-
-        // 3. define process callback handler
-        struct State {
-            ports: Vec<Port<AudioOut>>,
-            audio_rx: mpsc::Receiver<f32>,
-            buf_size: usize,
-            desc: RxDescriptor,
-            status: StatusApi,
-        }
-
-        let process = jack::contrib::ClosureProcessHandler::with_state(
-            State {
-                ports,
-                audio_rx,
-                buf_size: 0,
-                desc: desc.clone(),
-                status,
-            },
-            |state, _, ps| -> jack::Control {
-                // Get output buffer
-                let channels = state.ports.len();
-                let buffer_size = state.ports[0].as_mut_slice(ps).len();
-
-                if state.buf_size != buffer_size {
-                    state.buf_size = buffer_size;
-                    state
-                        .status
-                        .publish_blocking(Status::Receiver(Receiver::LinkOffset(
-                            state.desc.id,
-                            state.desc.to_link_offset(buffer_size),
-                        )))
-                        .ok();
+        'main: loop {
+            // TODO fade out before close
+            match control_rx.try_recv() {
+                Ok(resp) => {
+                    close(resp).await;
+                    break 'main;
                 }
+                Err(e) => match e {
+                    oneshot::error::TryRecvError::Empty => (),
+                    oneshot::error::TryRecvError::Closed => break 'main,
+                },
+            }
 
-                for i in 0..buffer_size {
-                    for ch in 0..channels {
-                        state.ports[ch].as_mut_slice(ps)[i] = match state.audio_rx.try_recv() {
-                            Ok(sample) => sample,
-                            Err(_) => 0.0,
-                        };
+            // TODO fade in on start
+
+            for buf in socket_buf.chunks_mut(rtp_packet_size) {
+                select! {
+                    Ok(tx) = &mut control_rx => {
+                        close(tx).await;
+                        break 'main
+                    },
+                    recv = socket.recv(buf) => match recv {
+                        Ok(len) => {
+                            if len != rtp_packet_size {
+                                log::warn!(
+                                    "Unexpected number of bytes read: {} (expected packet length is {})",
+                                    len,
+                                    rtp_packet_size
+                                );
+                            }
+                        },
+                        Err(e) => {
+                            log::error!("Socket I/O error: {e}");
+                            break 'main;
+                        }
                     }
                 }
+            }
 
-                // Continue as normal
-                jack::Control::Continue
-            },
-            move |_, _, _| jack::Control::Continue,
-        );
-
-        // 4. Activate the client
-        let active_client = client.activate_async((), process).unwrap();
-
-        // connect the ports to the system audio.
-
-        // for ch in (1..desc.channels + 1).take(2) {
-        //     active_client
-        //         .as_client()
-        //         .connect_ports_by_name(
-        //             &format!("{}:{}", desc.session_name, ch),
-        //             &format!("REAPER:in{}", ch),
-        //         )
-        //         .unwrap();
-        // }
-
-        // generic
-
-        spawn(async move {
-            let buf_size = desc.rtp_buffer_size();
-            log::debug!(
-                "RTP receiver buffer: {} frames",
-                desc.frames_per_link_offset_buffer()
-            );
-            let mut socket_buf = init_buffer(buf_size, || 0u8);
-
-            let close = move |tx: Response<()>| async move {
-                if let Err(err) = active_client.deactivate() {
-                    tx.send(Err(RxError::IoError(io::Error::new(
-                        io::ErrorKind::Other,
-                        err,
-                    ))))
-                    .ok();
-                } else {
-                    tx.send(Ok(())).ok();
+            let rtps = match RtpIter::new(&socket_buf, rtp_packet_size) {
+                Ok(it) => it,
+                Err(e) => {
+                    log::error!("Could not parse RTP packet: {e:?}");
+                    continue 'main;
                 }
             };
 
-            'main: loop {
-                // TODO fade out before close
-                match control_rx.try_recv() {
-                    Ok(resp) => {
-                        close(resp).await;
-                        break 'main;
-                    }
-                    Err(e) => match e {
-                        oneshot::error::TryRecvError::Empty => (),
-                        oneshot::error::TryRecvError::Closed => break 'main,
-                    },
-                }
-
-                // TODO fade in on start
-
-                for buf in socket_buf.chunks_mut(rtp_packet_size) {
+            for rtp in rtps {
+                for raw_sample in rtp.payload().chunks(bytes_per_sample) {
+                    let sample = read_f32_sample(raw_sample);
                     select! {
                         Ok(tx) = &mut control_rx => {
                             close(tx).await;
                             break 'main
                         },
-                        recv = socket.recv(buf) => match recv {
-                            Ok(len) => {
-                                if len != rtp_packet_size {
-                                    log::warn!(
-                                        "Unexpected number of bytes read: {} (expected packet length is {})",
-                                        len,
-                                        rtp_packet_size
-                                    );
-                                }
-                            },
-                            Err(e) => {
-                                log::error!("Socket I/O error: {e}");
-                                break 'main;
-                            }
-                        }
-                    }
-                }
-
-                let rtps = match RtpIter::new(&socket_buf, rtp_packet_size) {
-                    Ok(it) => it,
-                    Err(e) => {
-                        log::error!("Could not parse RTP packet: {e:?}");
-                        continue 'main;
-                    }
-                };
-
-                for rtp in rtps {
-                    for raw_sample in rtp.payload().chunks(bytes_per_sample) {
-                        let sample = read_f32_sample(raw_sample);
-                        select! {
-                            Ok(tx) = &mut control_rx => {
-                                close(tx).await;
-                                break 'main
-                            },
-                            snd = audio_tx.send(sample) => if let Err(e) = snd {
-                                log::info!("Error forwarding sample: {e}");
-                                break 'main;
-                            },
-                            else => break 'main,
-                        }
+                        snd = audio_tx.send(sample) => if let Err(e) = snd {
+                            log::info!("Error forwarding sample: {e}");
+                            break 'main;
+                        },
+                        else => break 'main,
                     }
                 }
             }
-        });
+        }
+    });
 
-        Ok(())
-    }
+    Ok(())
 }
 
 fn pad_sample(payload: &[u8]) -> [u8; 4] {
