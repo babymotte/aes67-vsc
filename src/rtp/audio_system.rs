@@ -15,8 +15,26 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-pub mod rx;
-pub mod tx;
+mod jack;
 
-pub use rx::*;
-pub use tx::*;
+pub(crate) use jack::JackAudioSystem;
+
+use tokio::sync::{mpsc, oneshot};
+
+pub(crate) trait AudioSystem {
+    type SampleFormat;
+
+    fn close(&mut self);
+}
+
+pub(crate) type TransmitterBufferInitCallback<S> =
+    mpsc::Sender<(usize, oneshot::Sender<Box<[mpsc::Receiver<S>]>>)>;
+
+// pub(crate) type TransmitterBufferInitCallbackReceiver<S> =
+//     mpsc::Receiver<(usize, oneshot::Sender<Box<[mpsc::Receiver<S>]>>)>;
+
+pub(crate) type ReceiverBufferInitCallback<S> =
+    mpsc::Sender<(usize, oneshot::Sender<Box<[mpsc::Receiver<S>]>>)>;
+
+// pub(crate) type ReceiverBufferInitCallbackReceiver<S> =
+//     mpsc::Receiver<(usize, oneshot::Sender<Box<[mpsc::Receiver<S>]>>)>;

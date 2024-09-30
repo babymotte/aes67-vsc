@@ -19,7 +19,7 @@ use crate::actor::{respond, Actor, ActorApi};
 use aes67_vsc::{
     error::{RxError, SapError},
     ptp::PtpApi,
-    rtp::{rx::RtpRxApi, tx::RtpTxApi},
+    rtp::{RtpRxApi, RtpTxApi},
     sap::SapApi,
 };
 use axum::{
@@ -40,7 +40,10 @@ use tokio::sync::{
     oneshot::{self, error::RecvError},
 };
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::{
+    services::{ServeDir, ServeFile},
+    trace::TraceLayer,
+};
 use worterbuch_client::{config::Config, Worterbuch};
 
 #[derive(Error, Debug)]
@@ -143,6 +146,7 @@ pub async fn ui(
                 .route("/api/v1/wb/config", get(wb_config))
                 .nest_service("/", serve_dir.clone())
                 .fallback_service(serve_dir)
+                .layer(TraceLayer::new_for_http())
                 .with_state(ui_api);
 
             let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))

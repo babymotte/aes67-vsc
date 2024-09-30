@@ -67,8 +67,8 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_writer(io::stderr)
-        .with_env_filter(EnvFilter::from_default_env())
         .with_max_level(args.verbose.log_level_filter().as_trace())
+        .with_env_filter(EnvFilter::from_default_env())
         .init();
 
     Toplevel::new(move |s| async move {

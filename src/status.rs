@@ -31,8 +31,6 @@ use worterbuch_client::{topic, Value, Worterbuch};
 pub enum Status {
     UsedInputChannels(usize, usize),
     UsedOutputChannels(usize, usize),
-    UsedTransmitters(usize, usize),
-    UsedReceivers(usize, usize),
     Receiver(Receiver),
 }
 
@@ -178,14 +176,6 @@ impl StatusActor {
             Status::UsedOutputChannels(used, max) => Action::Set(vec![
                 (topic!("resources", "outputChannels", "used"), json!(used)),
                 (topic!("resources", "outputChannels", "max"), json!(max)),
-            ]),
-            Status::UsedTransmitters(used, max) => Action::Set(vec![
-                (topic!("resources", "transmitters", "used"), json!(used)),
-                (topic!("resources", "transmitters", "max"), json!(max)),
-            ]),
-            Status::UsedReceivers(used, max) => Action::Set(vec![
-                (topic!("resources", "receivers", "used"), json!(used)),
-                (topic!("resources", "receivers", "max"), json!(max)),
             ]),
             Status::Receiver(receiver) => match receiver {
                 Receiver::Created(desc, sdp) => {

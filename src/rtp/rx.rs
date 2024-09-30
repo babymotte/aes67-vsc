@@ -15,29 +15,31 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+use super::{
+    audio_system::{AudioSystem, JackAudioSystem},
+    socket::{create_ipv4_rx_socket, create_ipv6_rx_socket},
+    Matrix,
+};
 use crate::{
     actor::{respond, Actor, ActorApi},
     error::{RxError, RxResult},
     status::{Receiver, Status, StatusApi},
-    utils::{session_id, RtpIter},
+    utils::{init_buffer, RtpSequenceBuffer},
     ReceiverId,
 };
 use core::f32;
-use jack::{AudioOut, Port};
 use sdp::{
     description::common::{Address, ConnectionInformation},
     SessionDescription,
 };
-use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use std::{
-    collections::HashMap,
-    io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-};
+use std::{collections::HashMap, net::IpAddr};
 use tokio::{
     net::UdpSocket,
     select, spawn,
-    sync::{mpsc, oneshot},
+    sync::{
+        mpsc::{self},
+        oneshot,
+    },
 };
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
 use tokio_util::sync::CancellationToken;
@@ -53,6 +55,7 @@ pub struct RxDescriptor {
     pub sampling_rate: usize,
     pub packet_time: f32,
     pub link_offset: f32,
+    pub origin_ip: IpAddr,
 }
 
 impl RxDescriptor {
@@ -111,6 +114,11 @@ impl RxDescriptor {
         let session_name = sd.session_name.clone();
         let session_id = sd.origin.session_id;
         let session_version = sd.origin.session_version;
+        let origin_ip = sd
+            .origin
+            .unicast_address
+            .parse()
+            .map_err(|e| RxError::Other(format!("error parsing origin IP: {e}")))?;
 
         Ok(RxDescriptor {
             id: receiver_id,
@@ -122,11 +130,39 @@ impl RxDescriptor {
             sampling_rate,
             packet_time,
             link_offset,
+            origin_ip,
         })
     }
 
-    pub fn rtp_header_len(&self) -> usize {
+    pub fn session_id_from_sdp(sdp: &SessionDescription) -> String {
+        format!("{} {}", sdp.origin.session_id, sdp.origin.session_version)
+    }
+
+    pub fn session_id(&self) -> String {
+        format!("{} {}", self.session_id, self.session_version)
+    }
+
+    pub fn rtp_header_len() -> usize {
         12
+    }
+
+    pub fn max_samplerate() -> usize {
+        96000
+    }
+
+    pub fn max_bit_depth() -> usize {
+        32
+    }
+
+    pub fn max_packet_time() -> usize {
+        4
+    }
+
+    pub fn max_packet_size(channels: usize) -> usize {
+        Self::rtp_header_len()
+            * (channels * Self::max_samplerate() * Self::max_packet_time() * Self::max_bit_depth())
+            / 8
+            / 1000
     }
 
     pub fn bytes_per_sample(&self) -> usize {
@@ -145,12 +181,12 @@ impl RxDescriptor {
         self.channels * self.frames_per_packet()
     }
 
-    pub fn packets_in_link_offset(&self) -> f32 {
-        self.link_offset / self.packet_time
+    pub fn packets_in_link_offset(&self) -> usize {
+        f32::ceil(self.link_offset / self.packet_time) as usize
     }
 
     pub fn frames_per_link_offset_buffer(&self) -> usize {
-        f32::ceil(self.packets_in_link_offset() * self.frames_per_packet() as f32) as usize
+        self.packets_in_link_offset() * self.frames_per_packet()
     }
 
     pub fn rtp_payload_size(&self) -> usize {
@@ -158,7 +194,7 @@ impl RxDescriptor {
     }
 
     pub fn rtp_packet_size(&self) -> usize {
-        self.rtp_header_len() + self.rtp_payload_size()
+        Self::rtp_header_len() + self.rtp_payload_size()
     }
 
     pub fn audio_buffer_size(&self) -> usize {
@@ -166,7 +202,7 @@ impl RxDescriptor {
     }
 
     pub fn rtp_buffer_size(&self) -> usize {
-        f32::ceil(self.packets_in_link_offset() * self.rtp_packet_size() as f32) as usize
+        self.packets_in_link_offset() * self.rtp_packet_size()
     }
 
     pub fn to_link_offset(&self, samples: usize) -> usize {
@@ -227,14 +263,29 @@ impl RtpRxApi {
     ) -> Result<Self, RxError> {
         let (channel, commands) = mpsc::channel(1);
 
+        let (trans_init_tx, _trans_init_rx) = mpsc::channel(max_channels);
+        let (recv_init_tx, recv_init_rx) = mpsc::channel(max_channels);
+        let audio_system =
+            JackAudioSystem::new(&subsys, 0, trans_init_tx, max_channels, recv_init_tx)
+                .expect("audio system failed");
+
+        let sample_reader = read_f32_sample;
+
         subsys.start(SubsystemBuilder::new("rtp/rx", move |s| async move {
-            let mut actor = RtpRxActor::new(commands, max_channels, link_offset, status);
+            let cancel = s.create_cancellation_token();
+            let mut actor: RtpRxActor<JackAudioSystem, f32> = RtpRxActor::new(
+                s,
+                commands,
+                max_channels,
+                link_offset,
+                status,
+                recv_init_rx,
+                audio_system,
+                sample_reader,
+            );
             actor.log_channel_consumption().await?;
-            let res = actor
-                .run("rtp-rx".to_owned(), s.create_cancellation_token())
-                .await;
-            log::info!("RX thread terminated.");
-            s.request_shutdown();
+            let res = actor.run("rtp-rx".to_owned(), cancel).await;
+            log::info!("RX stopped.");
             res
         }));
 
@@ -265,19 +316,41 @@ pub enum RxConfig {
     LinkOffset(usize),
 }
 
-struct RtpRxActor {
+struct RtpRxActor<AS, SampleFormat>
+where
+    AS: AudioSystem,
+    SampleFormat: Default + Send + Sync + 'static,
+{
     commands: mpsc::Receiver<RxFunction>,
-    receiver_ids: HashMap<String, RxDescriptor>,
-    active_receivers: Vec<Option<String>>,
     max_channels: usize,
     used_channels: usize,
     link_offset: f32,
     status: StatusApi,
-    playout_streams: Box<[Option<oneshot::Sender<Response<()>>>]>,
-    rx_descriptors: Box<[Option<RxDescriptor>]>,
+    subsys: SubsystemHandle,
+    recv_init_rx: mpsc::Receiver<(usize, oneshot::Sender<Box<[mpsc::Receiver<SampleFormat>]>>)>,
+    _audio_system: AS,
+    receiver_ids: HashMap<String, ReceiverId>,
+    active_receivers: Box<[Option<(RxDescriptor, mpsc::Sender<ReceiverMessage<SampleFormat>>)>]>,
+    sample_reader: fn(&[u8]) -> SampleFormat,
+    matrix: Matrix,
+    port_txs: Box<[Option<mpsc::Sender<SampleFormat>>]>,
 }
 
-impl Actor for RtpRxActor {
+impl<AS, S> Drop for RtpRxActor<AS, S>
+where
+    AS: AudioSystem,
+    S: Default + Send + Sync + 'static,
+{
+    fn drop(&mut self) {
+        self.subsys.request_shutdown();
+    }
+}
+
+impl<AS, S> Actor for RtpRxActor<AS, S>
+where
+    AS: AudioSystem,
+    S: Copy + Default + Send + Sync + 'static,
+{
     type Message = RxFunction;
     type Error = RxError;
 
@@ -302,6 +375,10 @@ impl Actor for RtpRxActor {
                 Some(msg) = self.commands.recv() => if !self.process_message(msg).await {
                     break;
                 },
+                Some((buffer_size,tx)) = self.recv_init_rx.recv() => {
+                    log::info!("Initializing receiver channel buffer …");
+                    tx.send(self.initialize_receiver_buffer(self.max_channels, buffer_size).await?).ok();
+                },
                 // Some(e) = self.rx_thread_event_rx.recv() =>  if !self.process_event(e).await {
                 //     break;
                 // },
@@ -313,28 +390,40 @@ impl Actor for RtpRxActor {
     }
 }
 
-impl RtpRxActor {
+impl<AS, S> RtpRxActor<AS, S>
+where
+    AS: AudioSystem,
+    S: Copy + Default + Send + Sync + 'static,
+{
     fn new(
+        subsys: SubsystemHandle,
         commands: mpsc::Receiver<RxFunction>,
         max_channels: usize,
         link_offset: f32,
         status: StatusApi,
+        recv_init_rx: mpsc::Receiver<(usize, oneshot::Sender<Box<[mpsc::Receiver<S>]>>)>,
+        audio_system: AS,
+        sample_reader: fn(&[u8]) -> S,
     ) -> Self {
         let receiver_ids = HashMap::new();
-        let active_receivers = vec![None; max_channels];
-        let playout_streams = init_buffer(max_channels, || None);
-        let rx_descriptors = init_buffer(max_channels, || None);
+        let active_receivers = init_buffer(max_channels, |_| None);
+        let matrix = Matrix::default_output(max_channels);
+        let port_txs = init_buffer(max_channels, |_| None);
 
         RtpRxActor {
+            subsys,
             commands,
-            receiver_ids,
-            active_receivers,
             max_channels,
             used_channels: 0,
             link_offset,
             status,
-            playout_streams,
-            rx_descriptors,
+            recv_init_rx,
+            _audio_system: audio_system,
+            receiver_ids,
+            active_receivers,
+            sample_reader,
+            matrix,
+            port_txs,
         }
     }
 
@@ -354,9 +443,38 @@ impl RtpRxActor {
     //     }
     // }
 
+    async fn initialize_receiver_buffer(
+        &mut self,
+        channels: usize,
+        buffer_size: usize,
+    ) -> RxResult<Box<[mpsc::Receiver<S>]>> {
+        let mut senders = vec![];
+        let mut receivers = vec![];
+
+        for _ in 0..channels {
+            let (tx, rx) = mpsc::channel(buffer_size);
+            senders.push(Some(tx));
+            receivers.push(rx);
+        }
+
+        self.port_txs = senders.into();
+
+        for rec in &self.active_receivers {
+            if let Some((desc, updates)) = rec {
+                let mapping = self.get_channel_mapping(desc);
+                updates
+                    .send(ReceiverMessage::ChannelMapping(mapping))
+                    .await
+                    .ok();
+            }
+        }
+
+        Ok(receivers.into())
+    }
+
     async fn create_receiver(&mut self, sdp: SessionDescription) -> RxResult<()> {
-        let session_id = session_id(&sdp);
-        let receiver_id = if let Some(id) = self.receiver_ids.get(&session_id).map(|d| d.id) {
+        let session_id = RxDescriptor::session_id_from_sdp(&sdp);
+        let receiver_id = if let Some(id) = self.receiver_ids.remove(&session_id) {
             self.delete_receiver(id).await?;
             id
         } else {
@@ -377,23 +495,25 @@ impl RtpRxActor {
             return Err(RxError::MaxChannelsExceeded(self.max_channels));
         }
         log::info!("Creating receiver '{receiver_id}' for session '{session_id}' …",);
+        self.used_channels += desc.channels;
+        self.receiver_ids.insert(session_id, desc.id);
+
         let socket = create_rx_socket(&sdp).await?;
 
-        self.rx_descriptors[receiver_id] = Some(desc.clone());
-        let (control_tx, control_rx) = oneshot::channel();
-        let status = self.status.clone();
-        let po_desc = desc.clone();
+        let (updates_tx, updates) = mpsc::channel(1);
+        let mapping = self.get_channel_mapping(&desc);
+        updates_tx
+            .send(ReceiverMessage::ChannelMapping(mapping))
+            .await
+            .ok();
+        self.active_receivers[receiver_id] = Some((desc.clone(), updates_tx));
 
-        playout_stream(socket, po_desc, control_rx, status).await?;
+        let receive_loop = ReceiveLoop::new(desc.clone(), updates, socket, self.sample_reader);
+        spawn(receive_loop.run());
 
-        self.playout_streams[receiver_id] = Some(control_tx);
-
-        self.receiver_ids.insert(session_id.clone(), desc.clone());
-        self.active_receivers[receiver_id] = Some(session_id);
-        self.used_channels += desc.channels;
         self.status
             .publish(Status::Receiver(Receiver::Created(
-                desc.clone(),
+                desc,
                 Some(sdp.marshal()),
             )))
             .await?;
@@ -403,25 +523,48 @@ impl RtpRxActor {
         Ok(())
     }
 
+    fn get_channel_mapping(&self, desc: &RxDescriptor) -> Box<[Box<[mpsc::Sender<S>]>]> {
+        let mut mapping = vec![vec![]; desc.channels];
+
+        match &self.matrix {
+            Matrix::Input(_, _) => panic!("RX has input matrix"),
+            Matrix::Output(hash_map, _) => {
+                for ch_nr in 0..desc.channels {
+                    for (port, ch) in hash_map {
+                        if ch.transceiver_id == desc.id && ch_nr == ch.channel_nr {
+                            if let Some(tx) = &self.port_txs[*port] {
+                                mapping[ch_nr].push(tx.to_owned());
+                                log::info!("{ch:?} => {port}")
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        mapping
+            .into_iter()
+            .map(Box::from)
+            .collect::<Vec<Box<[mpsc::Sender<S>]>>>()
+            .into()
+    }
+
     async fn delete_receiver(&mut self, receiver_id: ReceiverId) -> RxResult<()> {
         if receiver_id >= self.active_receivers.len() {
             return Err(RxError::InvalidReceiverId(receiver_id));
         }
 
-        let session_id = if let Some(it) = self.active_receivers[receiver_id].take() {
-            it
-        } else {
-            return Err(RxError::InvalidReceiverId(receiver_id));
-        };
+        if let Some((desc, updates)) = self.active_receivers[receiver_id].take() {
+            log::info!(
+                "Deleting receiver '{receiver_id}' for session '{}' …",
+                desc.session_id
+            );
 
-        log::info!("Deleting receiver '{receiver_id}' for session '{session_id}' …",);
+            self.receiver_ids.remove(&desc.session_id());
 
-        if let Some(desc) = self.receiver_ids.remove(&session_id) {
+            updates.send(ReceiverMessage::Stop).await.ok();
+
             self.used_channels -= desc.channels;
-
-            log::info!("Stopping receiver '{receiver_id}' …");
-            drop(self.rx_descriptors[receiver_id].take());
-            drop(self.playout_streams[receiver_id].take());
 
             self.status
                 .publish(Status::Receiver(Receiver::Deleted(desc.clone())))
@@ -429,8 +572,8 @@ impl RtpRxActor {
             log::info!("Receiver {receiver_id} deleted.",);
             self.log_channel_consumption().await?;
         } else {
-            log::warn!("Receiver '{receiver_id}' does not exist.");
-        }
+            return Err(RxError::InvalidReceiverId(receiver_id));
+        };
 
         Ok(())
     }
@@ -485,6 +628,7 @@ async fn create_rx_socket(sdp: &SessionDescription) -> Result<UdpSocket, RxError
     }
 
     let port = media.media_name.port.value.to_owned() as u16;
+    // let port = 0u16;
 
     let c = media.connection_information.as_ref().or(global_c);
 
@@ -540,264 +684,13 @@ async fn create_rx_socket(sdp: &SessionDescription) -> Result<UdpSocket, RxError
     };
 
     let socket = match ip_addr {
-        IpAddr::V4(ipv4_addr) => create_ipv4_socket(ipv4_addr, port)?,
-        IpAddr::V6(ipv6_addr) => create_ipv6_socket(ipv6_addr, port)?,
+        IpAddr::V4(ipv4_addr) => create_ipv4_rx_socket(ipv4_addr, port)?,
+        IpAddr::V6(ipv6_addr) => create_ipv6_rx_socket(ipv6_addr, port)?,
     };
 
     let tokio_socket = UdpSocket::from_std(socket.into())?;
 
     Ok(tokio_socket)
-}
-
-fn create_ipv4_socket(ip_addr: Ipv4Addr, port: u16) -> Result<Socket, RxError> {
-    log::info!(
-        "Creating IPv4 {} RX socket for stream at {}:{}",
-        if ip_addr.is_multicast() {
-            "multicast"
-        } else {
-            "unicast"
-        },
-        ip_addr,
-        port
-    );
-
-    let local_ip = if ip_addr.is_multicast() {
-        Ipv4Addr::UNSPECIFIED
-    } else {
-        ip_addr
-    };
-    let local_addr = SocketAddr::new(IpAddr::V4(local_ip), port);
-
-    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-
-    socket.set_reuse_address(true)?;
-    socket.set_reuse_port(true)?;
-    socket.set_nonblocking(true)?;
-
-    socket.bind(&SockAddr::from(local_addr))?;
-    if ip_addr.is_multicast() {
-        socket.join_multicast_v4(&ip_addr, &local_ip)?
-    }
-    Ok(socket)
-}
-
-fn create_ipv6_socket(ip_addr: Ipv6Addr, port: u16) -> Result<Socket, RxError> {
-    log::info!(
-        "Creating IPv6 {} RX socket for stream at {}:{}",
-        if ip_addr.is_multicast() {
-            "multicast"
-        } else {
-            "unicast"
-        },
-        ip_addr,
-        port
-    );
-
-    let local_ip = if ip_addr.is_multicast() {
-        Ipv6Addr::UNSPECIFIED
-    } else {
-        ip_addr
-    };
-    let local_addr = SocketAddr::new(IpAddr::V6(local_ip), port);
-
-    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-
-    socket.set_reuse_address(true)?;
-    socket.set_reuse_port(true)?;
-    socket.set_nonblocking(true)?;
-
-    socket.bind(&SockAddr::from(local_addr))?;
-    if ip_addr.is_multicast() {
-        socket.join_multicast_v6(&ip_addr, 0)?
-    }
-    Ok(socket)
-}
-
-async fn playout_stream(
-    socket: UdpSocket,
-    desc: RxDescriptor,
-    mut control_rx: oneshot::Receiver<Response<()>>,
-    status: StatusApi,
-) -> RxResult<()> {
-    // init
-
-    let rtp_packet_size = desc.rtp_packet_size();
-    let bytes_per_sample = desc.bytes_per_sample();
-
-    let (audio_tx, audio_rx) = mpsc::channel(desc.rtp_buffer_size());
-
-    // JACK specific
-
-    // 1. open a client
-    let client_name = format!(
-        "{}-{}-{}",
-        desc.session_name, desc.session_id, desc.session_version
-    );
-    let (client, _status) =
-        jack::Client::new(&client_name, jack::ClientOptions::default()).unwrap();
-
-    let spec = jack::AudioOut::default();
-
-    let ports: Vec<Port<AudioOut>> = (0..desc.channels)
-        .map(|i| {
-            client
-                .register_port(&format!("out{}", i + 1), spec)
-                .unwrap()
-        })
-        .collect();
-
-    // 3. define process callback handler
-    struct State {
-        ports: Vec<Port<AudioOut>>,
-        audio_rx: mpsc::Receiver<f32>,
-        buf_size: usize,
-        desc: RxDescriptor,
-        status: StatusApi,
-    }
-
-    let process = jack::contrib::ClosureProcessHandler::with_state(
-        State {
-            ports,
-            audio_rx,
-            buf_size: 0,
-            desc: desc.clone(),
-            status,
-        },
-        |state, _, ps| -> jack::Control {
-            // Get output buffer
-            let channels = state.ports.len();
-            let buffer_size = state.ports[0].as_mut_slice(ps).len();
-
-            if state.buf_size != buffer_size {
-                state.buf_size = buffer_size;
-                state
-                    .status
-                    .publish_blocking(Status::Receiver(Receiver::LinkOffset(
-                        state.desc.id,
-                        state.desc.to_link_offset(buffer_size),
-                    )))
-                    .ok();
-            }
-
-            for i in 0..buffer_size {
-                for ch in 0..channels {
-                    state.ports[ch].as_mut_slice(ps)[i] = match state.audio_rx.try_recv() {
-                        Ok(sample) => sample,
-                        Err(_) => 0.0,
-                    };
-                }
-            }
-
-            // Continue as normal
-            jack::Control::Continue
-        },
-        move |_, _, _| jack::Control::Continue,
-    );
-
-    // 4. Activate the client
-    let active_client = client.activate_async((), process).unwrap();
-
-    // connect the ports to the system audio.
-
-    // for ch in (1..desc.channels + 1).take(2) {
-    //     active_client
-    //         .as_client()
-    //         .connect_ports_by_name(
-    //             &format!("{}:{}", desc.session_name, ch),
-    //             &format!("REAPER:in{}", ch),
-    //         )
-    //         .unwrap();
-    // }
-
-    // generic
-
-    spawn(async move {
-        let buf_size = desc.rtp_buffer_size();
-        log::debug!(
-            "RTP receiver buffer: {} frames",
-            desc.frames_per_link_offset_buffer()
-        );
-        let mut socket_buf = init_buffer(buf_size, || 0u8);
-
-        let close = move |tx: Response<()>| async move {
-            if let Err(err) = active_client.deactivate() {
-                tx.send(Err(RxError::IoError(io::Error::new(
-                    io::ErrorKind::Other,
-                    err,
-                ))))
-                .ok();
-            } else {
-                tx.send(Ok(())).ok();
-            }
-        };
-
-        'main: loop {
-            // TODO fade out before close
-            match control_rx.try_recv() {
-                Ok(resp) => {
-                    close(resp).await;
-                    break 'main;
-                }
-                Err(e) => match e {
-                    oneshot::error::TryRecvError::Empty => (),
-                    oneshot::error::TryRecvError::Closed => break 'main,
-                },
-            }
-
-            // TODO fade in on start
-
-            for buf in socket_buf.chunks_mut(rtp_packet_size) {
-                select! {
-                    Ok(tx) = &mut control_rx => {
-                        close(tx).await;
-                        break 'main
-                    },
-                    recv = socket.recv(buf) => match recv {
-                        Ok(len) => {
-                            if len != rtp_packet_size {
-                                log::warn!(
-                                    "Unexpected number of bytes read: {} (expected packet length is {})",
-                                    len,
-                                    rtp_packet_size
-                                );
-                            }
-                        },
-                        Err(e) => {
-                            log::error!("Socket I/O error: {e}");
-                            break 'main;
-                        }
-                    }
-                }
-            }
-
-            let rtps = match RtpIter::new(&socket_buf, rtp_packet_size) {
-                Ok(it) => it,
-                Err(e) => {
-                    log::error!("Could not parse RTP packet: {e:?}");
-                    continue 'main;
-                }
-            };
-
-            for rtp in rtps {
-                for raw_sample in rtp.payload().chunks(bytes_per_sample) {
-                    let sample = read_f32_sample(raw_sample);
-                    select! {
-                        Ok(tx) = &mut control_rx => {
-                            close(tx).await;
-                            break 'main
-                        },
-                        snd = audio_tx.send(sample) => if let Err(e) = snd {
-                            log::info!("Error forwarding sample: {e}");
-                            break 'main;
-                        },
-                        else => break 'main,
-                    }
-                }
-            }
-        }
-    });
-
-    Ok(())
 }
 
 fn pad_sample(payload: &[u8]) -> [u8; 4] {
@@ -818,8 +711,82 @@ fn read_f32_sample(payload: &[u8]) -> f32 {
     (i as f64 / i32::MAX as f64) as f32
 }
 
-fn init_buffer<T>(size: usize, init: impl Fn() -> T) -> Box<[T]> {
-    let mut vec = Vec::with_capacity(size);
-    vec.resize_with(size, init);
-    vec.into()
+enum ReceiverMessage<S> {
+    ChannelMapping(Box<[Box<[mpsc::Sender<S>]>]>),
+    Stop,
+}
+
+struct ReceiveLoop<S, SR>
+where
+    SR: Fn(&[u8]) -> S,
+{
+    desc: RxDescriptor,
+    updates: mpsc::Receiver<ReceiverMessage<S>>,
+    socket: UdpSocket,
+    rtp_buffer: Box<[u8]>,
+    sequence_buffer: RtpSequenceBuffer,
+    sample_reader: SR,
+    port_transmitters: Box<[Box<[mpsc::Sender<S>]>]>,
+}
+
+impl<S, SR> ReceiveLoop<S, SR>
+where
+    S: Copy,
+    SR: Fn(&[u8]) -> S,
+{
+    fn new(
+        desc: RxDescriptor,
+        updates: mpsc::Receiver<ReceiverMessage<S>>,
+        socket: UdpSocket,
+        sample_reader: SR,
+    ) -> Self {
+        let rtp_buffer = init_buffer(desc.rtp_packet_size(), |_| 0u8);
+        let sequence_buffer = RtpSequenceBuffer::new(&desc);
+        let port_transmitters = init_buffer(desc.channels, |_| vec![].into());
+
+        Self {
+            desc,
+            updates,
+            socket,
+            sample_reader,
+            rtp_buffer,
+            sequence_buffer,
+            port_transmitters,
+        }
+    }
+
+    async fn run(mut self) {
+        loop {
+            select! {
+                Some(update) = self.updates.recv() => if !self.apply_update(update).await {
+                    break;
+                },
+                Ok((len, addr)) = self.socket.recv_from(&mut self.rtp_buffer) => {
+                    if addr.ip() != self.desc.origin_ip {
+                        // TODO fix
+                        log::error!("Received packet from wrong sender: {addr}");
+                    }
+                    if let Some(audio_data) = self.sequence_buffer.update(&self.rtp_buffer[0..len]) {
+                        for (i, raw_sample) in audio_data.chunks(self.desc.bytes_per_sample()).enumerate() {
+                            let channel = i % self.desc.channels;
+                            let port_transmitters = &self.port_transmitters[channel];
+                            let sample = (self.sample_reader)(raw_sample);
+                            for port_tx in port_transmitters {
+                                port_tx.send(sample).await.ok();
+                            }
+                        }
+                    }
+                },
+                else => break,
+            }
+        }
+    }
+
+    async fn apply_update(&mut self, msg: ReceiverMessage<S>) -> bool {
+        match msg {
+            ReceiverMessage::ChannelMapping(mapping) => self.port_transmitters = mapping,
+            ReceiverMessage::Stop => return false,
+        }
+        true
+    }
 }

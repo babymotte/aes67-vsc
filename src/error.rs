@@ -19,7 +19,7 @@ use std::io;
 
 use crate::{
     ptp::PtpFunction,
-    rtp::{rx::RxFunction, tx::TxFunction, RxConfig, RxThreadFunction},
+    rtp::{RxConfig, RxFunction, RxThreadFunction, TxFunction},
     sap::SapFunction,
     status::Status,
     ReceiverId,
@@ -32,10 +32,8 @@ use tokio::sync::{
 
 #[derive(Error, Debug)]
 pub enum Aes67Error {
-    #[error("error in transmitter: {0}")]
-    TxError(#[from] TxError),
-    #[error("error in receiver: {0}")]
-    RxError(#[from] RxError),
+    #[error("rtp error: {0}")]
+    RtpError(#[from] RtpError),
     #[error("error in session announcement: {0}")]
     SapError(#[from] SapError),
     #[error("ptp error: {0}")]
@@ -45,6 +43,18 @@ pub enum Aes67Error {
 }
 
 pub type Aes67Result<T> = Result<T, Aes67Error>;
+
+#[derive(Error, Debug)]
+pub enum RtpError {
+    #[error("tx error: {0}")]
+    TxError(#[from] TxError),
+    #[error("rx error: {0}")]
+    RxError(#[from] RxError),
+    #[error("jack error: {0}")]
+    JackError(#[from] jack::Error),
+}
+
+pub type RtpResult<T> = Result<T, RtpError>;
 
 #[derive(Error, Debug)]
 pub enum TxError {
@@ -82,6 +92,8 @@ pub enum RxError {
     NoPlayoutDevice(String),
     #[error("status error: {0}")]
     StatusError(#[from] StatusError),
+    #[error("error: {0}")]
+    Other(String),
 }
 
 pub type RxResult<T> = Result<T, RxError>;
