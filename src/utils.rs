@@ -15,9 +15,10 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+use pnet::ipnetwork::IpNetwork;
 use rtp_rs::{RtpReader, RtpReaderError, Seq};
-use std::{iter::Map, slice::Chunks, u16};
-use tokio::sync::mpsc;
+use std::{iter::Map, net::IpAddr, slice::Chunks, thread, u16};
+use tokio::{process::Command, spawn, sync::mpsc};
 
 use crate::rtp::RxDescriptor;
 
@@ -287,4 +288,14 @@ mod test {
         join1.await.unwrap();
         join2.await.unwrap();
     }
+}
+
+pub async fn open_browser(ip: IpAddr, port: u16) {
+    spawn(async move {
+        Command::new("xdg-open")
+            .arg(format!("http://{ip}:{port}"))
+            .output()
+            .await
+            .ok();
+    });
 }

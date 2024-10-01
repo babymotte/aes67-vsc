@@ -21,6 +21,7 @@ use aes67_vsc::{
     ptp::PtpApi,
     rtp::{RtpRxApi, RtpTxApi},
     sap::SapApi,
+    utils::open_browser,
 };
 use axum::{
     extract::State,
@@ -33,7 +34,7 @@ use miette::{IntoDiagnostic, Result};
 use pnet::{datalink, ipnetwork::IpNetwork};
 use sdp::SessionDescription;
 use serde::{Deserialize, Serialize};
-use std::{env, io::Cursor};
+use std::{env, io::Cursor, net::IpAddr};
 use thiserror::Error;
 use tokio::sync::{
     mpsc::{self, error::SendError},
@@ -128,6 +129,9 @@ pub async fn ui(
             for ip in iface.ips {
                 if let IpNetwork::V4(ip) = ip {
                     log::info!("WebUI: http://{}:{}", ip.ip(), port);
+                    if ip.ip().is_loopback() {
+                        open_browser(IpAddr::V4(ip.ip()), port).await;
+                    }
                 }
             }
         }
