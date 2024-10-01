@@ -247,13 +247,14 @@ async fn create_transmitter(
     let session_id = match ui_api.create_transmitter(payload.sdp).await {
         Ok(it) => Some(it),
         Err(e) => {
+            log::error!("Transmitter creation failed: {e}");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(TransmitterCreated {
                     session_id: None,
                     error: Some(e.to_string()),
                 }),
-            )
+            );
         }
     };
 
@@ -271,6 +272,7 @@ async fn receive_stream(
     Json(payload): Json<ReceiveStream>,
 ) -> impl IntoResponse {
     if let Err(e) = ui_api.receive_stream(payload.sdp).await {
+        log::error!("Receiver creation failed: {e}");
         return (
             StatusCode::BAD_REQUEST,
             Json(ReceivingStream {
@@ -294,6 +296,7 @@ async fn delete_receiver(
     Json(payload): Json<DeleteReceiver>,
 ) -> impl IntoResponse {
     if let Err(e) = ui_api.delete_receiver(payload.receiver).await {
+        log::error!("Receiver deletion failed: {e}");
         return (
             StatusCode::BAD_REQUEST,
             Json(ReceiverDeleted {

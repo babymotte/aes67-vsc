@@ -26,7 +26,7 @@ use aes67_vsc::{
 };
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
-use std::{io, time::Duration};
+use std::{io, net::IpAddr, time::Duration};
 #[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
 use tikv_jemallocator::Jemalloc;
 use tokio::{select, sync::oneshot};
@@ -57,6 +57,9 @@ struct Args {
     /// Max link offset it ms
     #[arg(short, long, default_value = "20")]
     link_offset: f32,
+    /// The local IP address to bind to
+    #[arg()]
+    ip: Option<IpAddr>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -106,8 +109,8 @@ async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
     let status =
         StatusApi::new(&subsys, wb.clone(), wb_root_key.clone() + "/status").into_diagnostic()?;
     let rtp_tx = RtpTxApi::new(&subsys).into_diagnostic()?;
-    let rtp_rx =
-        RtpRxApi::new(&subsys, args.inputs, link_offset, status.clone()).into_diagnostic()?;
+    let rtp_rx = RtpRxApi::new(&subsys, args.inputs, link_offset, status.clone(), args.ip)
+        .into_diagnostic()?;
     let sap = SapApi::new(&subsys, wb.clone(), wb_root_key.clone()).into_diagnostic()?;
     let ptp = PtpApi::new(&subsys).into_diagnostic()?;
 

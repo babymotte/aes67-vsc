@@ -32,7 +32,10 @@ use sdp::{
     description::common::{Address, ConnectionInformation},
     SessionDescription,
 };
-use std::{collections::HashMap, net::IpAddr};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+};
 use tokio::{
     net::UdpSocket,
     select, spawn,
@@ -260,6 +263,7 @@ impl RtpRxApi {
         max_channels: usize,
         link_offset: f32,
         status: StatusApi,
+        local_ip: Option<IpAddr>,
     ) -> Result<Self, RxError> {
         let (channel, commands) = mpsc::channel(1);
 
@@ -282,6 +286,7 @@ impl RtpRxApi {
                 recv_init_rx,
                 audio_system,
                 sample_reader,
+                local_ip,
             );
             actor.log_channel_consumption().await?;
             let res = actor.run("rtp-rx".to_owned(), cancel).await;
@@ -334,6 +339,7 @@ where
     sample_reader: fn(&[u8]) -> SampleFormat,
     matrix: Matrix,
     port_txs: Box<[Option<mpsc::Sender<SampleFormat>>]>,
+    local_ip: Option<IpAddr>,
 }
 
 impl<AS, S> Drop for RtpRxActor<AS, S>
@@ -404,6 +410,7 @@ where
         recv_init_rx: mpsc::Receiver<(usize, oneshot::Sender<Box<[mpsc::Receiver<S>]>>)>,
         audio_system: AS,
         sample_reader: fn(&[u8]) -> S,
+        local_ip: Option<IpAddr>,
     ) -> Self {
         let receiver_ids = HashMap::new();
         let active_receivers = init_buffer(max_channels, |_| None);
@@ -424,6 +431,7 @@ where
             sample_reader,
             matrix,
             port_txs,
+            local_ip,
         }
     }
 
@@ -498,7 +506,7 @@ where
         self.used_channels += desc.channels;
         self.receiver_ids.insert(session_id, desc.id);
 
-        let socket = create_rx_socket(&sdp).await?;
+        let socket = create_rx_socket(&sdp, self.local_ip).await?;
 
         let (updates_tx, updates) = mpsc::channel(1);
         let mapping = self.get_channel_mapping(&desc);
@@ -594,7 +602,10 @@ where
     }
 }
 
-async fn create_rx_socket(sdp: &SessionDescription) -> Result<UdpSocket, RxError> {
+async fn create_rx_socket(
+    sdp: &SessionDescription,
+    local_ip: Option<IpAddr>,
+) -> Result<UdpSocket, RxError> {
     let global_c = sdp.connection_information.as_ref();
 
     if sdp.media_descriptions.len() > 1 {
@@ -683,9 +694,25 @@ async fn create_rx_socket(sdp: &SessionDescription) -> Result<UdpSocket, RxError
         )));
     };
 
-    let socket = match ip_addr {
-        IpAddr::V4(ipv4_addr) => create_ipv4_rx_socket(ipv4_addr, port)?,
-        IpAddr::V6(ipv6_addr) => create_ipv6_rx_socket(ipv6_addr, port)?,
+    let socket = match (ip_addr, local_ip) {
+        (IpAddr::V4(ipv4_addr), Some(IpAddr::V4(local_ip))) => {
+            create_ipv4_rx_socket(ipv4_addr, local_ip, port)?
+        }
+        (IpAddr::V6(ipv6_addr), Some(IpAddr::V6(local_ip))) => {
+            create_ipv6_rx_socket(ipv6_addr, local_ip, port)?
+        }
+        (IpAddr::V4(ipv4_addr), None) => {
+            create_ipv4_rx_socket(ipv4_addr, Ipv4Addr::UNSPECIFIED, port)?
+        }
+        (IpAddr::V6(ipv6_addr), None) => {
+            create_ipv6_rx_socket(ipv6_addr, Ipv6Addr::UNSPECIFIED, port)?
+        }
+        (IpAddr::V4(_), Some(IpAddr::V6(_))) => Err(RxError::Other(
+            "Cannot receive IPv4 stream when bound to local IPv6 address".to_owned(),
+        ))?,
+        (IpAddr::V6(_), Some(IpAddr::V4(_))) => Err(RxError::Other(
+            "Cannot receive IPv6 stream when bound to local IPv4 address".to_owned(),
+        ))?,
     };
 
     let tokio_socket = UdpSocket::from_std(socket.into())?;
@@ -762,10 +789,7 @@ where
                     break;
                 },
                 Ok((len, addr)) = self.socket.recv_from(&mut self.rtp_buffer) => {
-                    if addr.ip() != self.desc.origin_ip {
-                        // TODO fix
-                        log::error!("Received packet from wrong sender: {addr}");
-                    } else {
+                    if addr.ip() == self.desc.origin_ip {
                         if let Some(audio_data) = self.sequence_buffer.update(&self.rtp_buffer[0..len]) {
                             for (i, raw_sample) in audio_data.chunks(self.desc.bytes_per_sample()).enumerate() {
                                 let channel = i % self.desc.channels;
@@ -776,6 +800,8 @@ where
                                 }
                             }
                         }
+                    } else {
+                        log::warn!("Received packet from wrong sender: {addr}");
                     }
                 },
                 else => break,
