@@ -40,6 +40,8 @@ pub enum Aes67Error {
     PtpError(#[from] PtpError),
     #[error("status error: {0}")]
     StatusError(#[from] StatusError),
+    #[error("discovery cleanup: {0}")]
+    DiscoveryCleanupError(#[from] DiscoveryCleanupError),
 }
 
 pub type Aes67Result<T> = Result<T, Aes67Error>;
@@ -134,3 +136,11 @@ pub enum StatusError {
 }
 
 pub type StatusResult<T> = Result<T, StatusError>;
+
+#[derive(Error, Debug)]
+pub enum DiscoveryCleanupError {
+    #[error("error in worterbuch connection: {0}")]
+    WorterbuchError(#[from] worterbuch_client::ConnectionError),
+}
+
+pub type DiscoveryCleanupResult<T> = Result<T, DiscoveryCleanupError>;

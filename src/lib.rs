@@ -16,6 +16,7 @@
  */
 
 pub(crate) mod actor;
+pub mod discovery_cleanup;
 pub mod error;
 pub mod ptp;
 pub mod rtp;

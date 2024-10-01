@@ -120,6 +120,7 @@ pub async fn ui(
     port: u16,
     wb: Worterbuch,
     wb_cfg: Config,
+    open_web_ui: bool,
 ) -> Result<()> {
     subsys.start(SubsystemBuilder::new("ui", move |s| async move {
         let webapp_root_dir =
@@ -129,7 +130,7 @@ pub async fn ui(
             for ip in iface.ips {
                 if let IpNetwork::V4(ip) = ip {
                     log::info!("WebUI: http://{}:{}", ip.ip(), port);
-                    if ip.ip().is_loopback() {
+                    if open_web_ui && ip.ip().is_loopback() {
                         open_browser(IpAddr::V4(ip.ip()), port).await;
                     }
                 }

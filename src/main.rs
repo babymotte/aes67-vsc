@@ -19,6 +19,7 @@ mod actor;
 mod ui;
 
 use aes67_vsc::{
+    discovery_cleanup::{self, cleanup_discovery},
     ptp::PtpApi,
     rtp::{RtpRxApi, RtpTxApi},
     sap::SapApi,
@@ -60,6 +61,9 @@ struct Args {
     /// The local IP address to bind to
     #[arg()]
     ip: Option<IpAddr>,
+    /// Open the web UI on start
+    #[arg(long)]
+    ui: bool,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -102,6 +106,7 @@ async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
     let wb_root_key = "aes67-vsc".to_owned();
 
     wb.set_client_name(&wb_root_key).await.into_diagnostic()?;
+
     wb.set_grave_goods(&[&topic!(wb_root_key, "status", "#")])
         .await
         .into_diagnostic()?;
@@ -114,7 +119,20 @@ async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
     let sap = SapApi::new(&subsys, wb.clone(), wb_root_key.clone()).into_diagnostic()?;
     let ptp = PtpApi::new(&subsys).into_diagnostic()?;
 
-    ui(&subsys, rtp_tx, rtp_rx, ptp, sap, port, wb.clone(), wb_cfg).await?;
+    cleanup_discovery(&subsys, wb.clone(), wb_root_key.clone());
+
+    ui(
+        &subsys,
+        rtp_tx,
+        rtp_rx,
+        ptp,
+        sap,
+        port,
+        wb.clone(),
+        wb_cfg,
+        args.ui,
+    )
+    .await?;
 
     select! {
         _ = subsys.on_shutdown_requested() => (),
