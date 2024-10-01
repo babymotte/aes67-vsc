@@ -19,9 +19,8 @@ use crate::rtp::RxDescriptor;
 use rtp_rs::{RtpReader, RtpReaderError, Seq};
 use std::{iter::Map, net::IpAddr, slice::Chunks, u16};
 use thread_priority::{
-    get_current_thread_priority, set_thread_priority_and_policy, thread_native_id,
-    thread_schedule_policy, unix, NormalThreadSchedulePolicy, RealtimeThreadSchedulePolicy,
-    ScheduleParams, ThreadPriority, ThreadPriorityOsValue, ThreadSchedulePolicy, NICENESS_MAX,
+    set_thread_priority_and_policy, thread_native_id, RealtimeThreadSchedulePolicy, ThreadPriority,
+    ThreadSchedulePolicy,
 };
 use tokio::{process::Command, spawn, sync::mpsc};
 
@@ -249,6 +248,7 @@ impl RtpSequenceBuffer {
 }
 
 pub fn set_realtime_priority() {
+    let pid = thread_native_id();
     if let Err(e) = set_thread_priority_and_policy(
         thread_native_id(),
         ThreadPriority::Max,
@@ -256,7 +256,7 @@ pub fn set_realtime_priority() {
     ) {
         log::warn!("Could not set thread priority: {e}");
     } else {
-        log::info!("Successfully set real time priority for current thread.");
+        log::info!("Successfully set real time priority for thread {pid}.");
     }
 }
 

@@ -18,7 +18,10 @@
 use super::{
     AudioSystem, Event, Message, ReceiverBufferInitCallback, TransmitterBufferInitCallback,
 };
-use crate::{error::RtpResult, utils::init_buffer};
+use crate::{
+    error::RtpResult,
+    utils::{init_buffer, set_realtime_priority},
+};
 use jack::{
     contrib::ClosureProcessHandler, AudioIn, AudioOut, Client, ClientOptions, Control, Frames,
     Port, ProcessScope,
@@ -101,6 +104,8 @@ impl JackAudioSystem {
 
         let (st, op) = oneshot::channel();
         thread::spawn(|| {
+            set_realtime_priority();
+
             let active_client = client.activate_async((), process).unwrap();
 
             connect_ports(active_client.as_client());
