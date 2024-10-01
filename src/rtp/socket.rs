@@ -41,7 +41,7 @@ pub(crate) fn create_ipv4_rx_socket(ip_addr: Ipv4Addr, port: u16) -> Result<Sock
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
 
     socket.set_reuse_address(true)?;
-    socket.set_reuse_port(true)?;
+    // socket.set_reuse_port(true)?;
     socket.set_nonblocking(true)?;
 
     socket.bind(&SockAddr::from(local_addr))?;
@@ -73,7 +73,7 @@ pub(crate) fn create_ipv6_rx_socket(ip_addr: Ipv6Addr, port: u16) -> Result<Sock
     let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
 
     socket.set_reuse_address(true)?;
-    socket.set_reuse_port(true)?;
+    // socket.set_reuse_port(true)?;
     socket.set_nonblocking(true)?;
 
     socket.bind(&SockAddr::from(local_addr))?;

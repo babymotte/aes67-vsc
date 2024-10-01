@@ -765,14 +765,15 @@ where
                     if addr.ip() != self.desc.origin_ip {
                         // TODO fix
                         log::error!("Received packet from wrong sender: {addr}");
-                    }
-                    if let Some(audio_data) = self.sequence_buffer.update(&self.rtp_buffer[0..len]) {
-                        for (i, raw_sample) in audio_data.chunks(self.desc.bytes_per_sample()).enumerate() {
-                            let channel = i % self.desc.channels;
-                            let port_transmitters = &self.port_transmitters[channel];
-                            let sample = (self.sample_reader)(raw_sample);
-                            for port_tx in port_transmitters {
-                                port_tx.send(sample).await.ok();
+                    } else {
+                        if let Some(audio_data) = self.sequence_buffer.update(&self.rtp_buffer[0..len]) {
+                            for (i, raw_sample) in audio_data.chunks(self.desc.bytes_per_sample()).enumerate() {
+                                let channel = i % self.desc.channels;
+                                let port_transmitters = &self.port_transmitters[channel];
+                                let sample = (self.sample_reader)(raw_sample);
+                                for port_tx in port_transmitters {
+                                    port_tx.send(sample).await.ok();
+                                }
                             }
                         }
                     }
