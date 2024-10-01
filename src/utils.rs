@@ -15,9 +15,8 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use pnet::ipnetwork::IpNetwork;
 use rtp_rs::{RtpReader, RtpReaderError, Seq};
-use std::{iter::Map, net::IpAddr, slice::Chunks, thread, u16};
+use std::{iter::Map, net::IpAddr, slice::Chunks, u16};
 use tokio::{process::Command, spawn, sync::mpsc};
 
 use crate::rtp::RxDescriptor;
@@ -200,7 +199,7 @@ impl<T: Default> DoubleBuffer<T> {
         let buffer_b = init_buffer(size, |_| T::default());
 
         let (producer_tx, consumer_rx) = mpsc::channel(1);
-        let (consumer_tx, producer_rx) = mpsc::channel(1);
+        let (consumer_tx, producer_rx) = mpsc::channel(2);
 
         producer_tx
             .send(buffer_a)

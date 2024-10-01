@@ -16,9 +16,9 @@
  */
 
 use super::{
-    audio_system::{AudioSystem, JackAudioSystem},
+    audio_system::{AudioSystem, Event, JackAudioSystem, Message},
     socket::{create_ipv4_rx_socket, create_ipv6_rx_socket},
-    Matrix,
+    OutputMatrix,
 };
 use crate::{
     actor::{respond, Actor, ActorApi},
@@ -35,6 +35,7 @@ use sdp::{
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     net::UdpSocket,
@@ -213,35 +214,11 @@ impl RxDescriptor {
     }
 }
 
-// #[derive(Debug)]
-// enum Dealloc {
-//     Socket(Socket),
-//     RxDescriptor(RxDescriptor),
-// }
-
-// #[derive(Debug)]
-// enum RxThreadEvent {
-//     BufferOverflow(ReceiverId),
-//     BufferUnderflow(ReceiverId),
-//     ThreadStopped,
-//     Err(RxError),
-//     Dealloc(Dealloc),
-// }
 #[derive(Debug)]
 pub enum RxThreadFunction {
     StartReceiver(ReceiverId, RxDescriptor, UdpSocket, Response<()>),
     StopReceiver(ReceiverId, Response<()>),
 }
-
-// struct RxThreadDestructor {
-//     event_tx: mpsc::UnboundedSender<RxThreadEvent>,
-// }
-
-// impl Drop for RxThreadDestructor {
-//     fn drop(&mut self) {
-//         self.event_tx.send(RxThreadEvent::ThreadStopped).ok();
-//     }
-// }
 
 #[derive(Clone)]
 pub struct RtpRxApi {
@@ -269,9 +246,43 @@ impl RtpRxApi {
 
         let (trans_init_tx, _trans_init_rx) = mpsc::channel(max_channels);
         let (recv_init_tx, recv_init_rx) = mpsc::channel(max_channels);
-        let audio_system =
-            JackAudioSystem::new(&subsys, 0, trans_init_tx, max_channels, recv_init_tx)
-                .expect("audio system failed");
+        let (event_tx, mut event_rx) = mpsc::channel(1000);
+        let (msg_tx, msg_rx) = mpsc::channel(1);
+
+        let jack_status = status.clone();
+        spawn(async move {
+            while let Some(e) = event_rx.recv().await {
+                match e {
+                    Event::BufferUnderrun(port) => {
+                        // TODO map port to receiver ID
+                        log::debug!("Buffer underrun in input {port}");
+                        if let Err(_) = jack_status
+                            .publish(Status::Receiver(Receiver::BufferUnderrun(
+                                port,
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .expect("your clock is seriously messed up")
+                                    .as_millis(),
+                            )))
+                            .await
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let audio_system = JackAudioSystem::new(
+            &subsys,
+            0,
+            trans_init_tx,
+            max_channels,
+            recv_init_tx,
+            event_tx,
+            msg_rx,
+        )
+        .expect("audio system failed");
 
         let sample_reader = read_f32_sample;
 
@@ -287,6 +298,7 @@ impl RtpRxApi {
                 audio_system,
                 sample_reader,
                 local_ip,
+                msg_tx,
             );
             actor.log_channel_consumption().await?;
             let res = actor.run("rtp-rx".to_owned(), cancel).await;
@@ -337,9 +349,11 @@ where
     receiver_ids: HashMap<String, ReceiverId>,
     active_receivers: Box<[Option<(RxDescriptor, mpsc::Sender<ReceiverMessage<SampleFormat>>)>]>,
     sample_reader: fn(&[u8]) -> SampleFormat,
-    matrix: Matrix,
+    matrix: OutputMatrix,
     port_txs: Box<[Option<mpsc::Sender<SampleFormat>>]>,
     local_ip: Option<IpAddr>,
+    active_ports: Box<[bool]>,
+    msg_tx: mpsc::Sender<Message>,
 }
 
 impl<AS, S> Drop for RtpRxActor<AS, S>
@@ -385,9 +399,6 @@ where
                     log::info!("Initializing receiver channel buffer …");
                     tx.send(self.initialize_receiver_buffer(self.max_channels, buffer_size).await?).ok();
                 },
-                // Some(e) = self.rx_thread_event_rx.recv() =>  if !self.process_event(e).await {
-                //     break;
-                // },
                 else => break,
             }
         }
@@ -411,11 +422,13 @@ where
         audio_system: AS,
         sample_reader: fn(&[u8]) -> S,
         local_ip: Option<IpAddr>,
+        msg_tx: mpsc::Sender<Message>,
     ) -> Self {
         let receiver_ids = HashMap::new();
         let active_receivers = init_buffer(max_channels, |_| None);
-        let matrix = Matrix::default_output(max_channels);
+        let matrix = OutputMatrix::default(max_channels);
         let port_txs = init_buffer(max_channels, |_| None);
+        let active_ports = init_buffer(max_channels, |_| false);
 
         RtpRxActor {
             subsys,
@@ -432,24 +445,10 @@ where
             matrix,
             port_txs,
             local_ip,
+            active_ports,
+            msg_tx,
         }
     }
-
-    // async fn process_event(&mut self, event: RxThreadEvent) -> bool {
-    //     match event {
-    //         RxThreadEvent::BufferOverflow(_) => todo!(),
-    //         RxThreadEvent::BufferUnderflow(_) => todo!(),
-    //         RxThreadEvent::ThreadStopped => false,
-    //         RxThreadEvent::Err(e) => {
-    //             log::error!("Error in receiver thread: {e}");
-    //             false
-    //         }
-    //         RxThreadEvent::Dealloc(it) => {
-    //             drop(it);
-    //             true
-    //         }
-    //     }
-    // }
 
     async fn initialize_receiver_buffer(
         &mut self,
@@ -508,6 +507,13 @@ where
 
         let socket = create_rx_socket(&sdp, self.local_ip).await?;
 
+        let changed_ports = self
+            .matrix
+            .auto_route(receiver_id, desc.channels)
+            .expect("port availability must be checked first");
+
+        self.activate_ports(changed_ports).await?;
+
         let (updates_tx, updates) = mpsc::channel(1);
         let mapping = self.get_channel_mapping(&desc);
         updates_tx
@@ -534,21 +540,16 @@ where
     fn get_channel_mapping(&self, desc: &RxDescriptor) -> Box<[Box<[mpsc::Sender<S>]>]> {
         let mut mapping = vec![vec![]; desc.channels];
 
-        match &self.matrix {
-            Matrix::Input(_, _) => panic!("RX has input matrix"),
-            Matrix::Output(hash_map, _) => {
-                for ch_nr in 0..desc.channels {
-                    for (port, ch) in hash_map {
-                        if ch.transceiver_id == desc.id && ch_nr == ch.channel_nr {
-                            if let Some(tx) = &self.port_txs[*port] {
-                                mapping[ch_nr].push(tx.to_owned());
-                                log::info!("{ch:?} => {port}")
-                            }
-                        }
+        for ch_nr in 0..desc.channels {
+            for (port, ch) in &self.matrix.mapping {
+                if ch.transceiver_id == desc.id && ch_nr == ch.channel_nr {
+                    if let Some(tx) = &self.port_txs[*port] {
+                        mapping[ch_nr].push(tx.to_owned());
+                        log::info!("{ch:?} => {port}")
                     }
                 }
             }
-        };
+        }
 
         mapping
             .into_iter()
@@ -567,6 +568,10 @@ where
                 "Deleting receiver '{receiver_id}' for session '{}' …",
                 desc.session_id
             );
+
+            let changed_ports = self.matrix.auto_unroute(receiver_id);
+
+            self.deactivate_ports(changed_ports).await?;
 
             self.receiver_ids.remove(&desc.session_id());
 
@@ -598,6 +603,28 @@ where
                 self.max_channels,
             ))
             .await?;
+        Ok(())
+    }
+
+    async fn activate_ports(&mut self, changed_ports: Vec<usize>) -> RxResult<()> {
+        for port in changed_ports {
+            self.active_ports[port] = true;
+        }
+        self.msg_tx
+            .send(Message::ActiveOutputsChanged(self.active_ports.clone()))
+            .await
+            .map_err(|e| RxError::Other(format!("could not update active ports: {e}")))?;
+        Ok(())
+    }
+
+    async fn deactivate_ports(&mut self, changed_ports: Vec<usize>) -> RxResult<()> {
+        for port in changed_ports {
+            self.active_ports[port] = false;
+        }
+        self.msg_tx
+            .send(Message::ActiveOutputsChanged(self.active_ports.clone()))
+            .await
+            .map_err(|e| RxError::Other(format!("could not update active ports: {e}")))?;
         Ok(())
     }
 }
@@ -639,7 +666,6 @@ async fn create_rx_socket(
     }
 
     let port = media.media_name.port.value.to_owned() as u16;
-    // let port = 0u16;
 
     let c = media.connection_information.as_ref().or(global_c);
 

@@ -49,8 +49,8 @@ pub enum Receiver {
     SessionName(ReceiverId, String),
     Sdp(ReceiverId, String),
     Meter(ReceiverId, usize, u16),
-    BufferUnderflow(ReceiverId, u64),
-    BufferOverflow(ReceiverId, u64),
+    BufferUnderrun(ReceiverId, u128),
+    BufferOverflow(ReceiverId, u128),
 }
 
 #[derive(Clone)]
@@ -258,8 +258,8 @@ impl StatusActor {
                     topic!("receivers", id, "meter", channel),
                     json!(value),
                 )]),
-                Receiver::BufferUnderflow(id, value) => Action::Set(vec![(
-                    topic!("receivers", id, "buffer", "underflow"),
+                Receiver::BufferUnderrun(id, value) => Action::Set(vec![(
+                    topic!("receivers", id, "buffer", "underrun"),
                     json!(value),
                 )]),
                 Receiver::BufferOverflow(id, value) => Action::Set(vec![(

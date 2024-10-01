@@ -38,3 +38,12 @@ pub(crate) type ReceiverBufferInitCallback<S> =
 
 // pub(crate) type ReceiverBufferInitCallbackReceiver<S> =
 //     mpsc::Receiver<(usize, oneshot::Sender<Box<[mpsc::Receiver<S>]>>)>;
+
+pub(crate) enum Event {
+    BufferUnderrun(usize),
+}
+
+pub(crate) enum Message {
+    ActiveInputsChanged(Box<[bool]>),
+    ActiveOutputsChanged(Box<[bool]>),
+}

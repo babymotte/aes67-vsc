@@ -24,7 +24,10 @@ pub use rx::*;
 pub use tx::*;
 
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, hash::Hash};
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    hash::Hash,
+};
 
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash, Serialize, Deserialize)]
 pub struct Channel {
@@ -42,25 +45,74 @@ impl Channel {
 }
 
 #[derive(Debug, Clone)]
-pub enum Matrix {
-    Input(HashMap<Channel, usize>, usize),
-    Output(HashMap<usize, Channel>, usize),
+pub struct OutputMatrix {
+    channels: usize,
+    mapping: HashMap<usize, Channel>,
 }
 
-impl Matrix {
-    pub fn default_output(outputs: usize) -> Matrix {
-        let mut map = HashMap::new();
-        for i in 0..outputs {
-            map.insert(i, Channel::new(i / 2, i % 2));
-        }
-        Matrix::Output(map, outputs)
+#[derive(Debug, Clone)]
+pub struct InputMatrix {
+    channels: usize,
+    mapping: HashMap<Channel, usize>,
+}
+
+impl OutputMatrix {
+    pub fn default(channels: usize) -> OutputMatrix {
+        let mapping = HashMap::new();
+        // for i in 0..outputs {
+        //     map.insert(i, Channel::new(i / 2, i % 2));
+        // }
+        OutputMatrix { channels, mapping }
     }
 
-    pub fn default_input(inputs: usize) -> Matrix {
-        let mut map = HashMap::new();
-        for i in 0..inputs {
-            map.insert(Channel::new(i / 2, i % 2), i);
+    pub fn auto_route(&mut self, receiver: usize, channels: usize) -> Option<Vec<usize>> {
+        if self.channels - self.mapping.len() < channels {
+            return None;
         }
-        Matrix::Input(map, inputs)
+
+        let mut ports = Vec::new();
+
+        let mut channel = 0;
+        for port in 0..self.channels {
+            match self.mapping.entry(port) {
+                Entry::Occupied(_) => continue,
+                Entry::Vacant(e) => {
+                    e.insert(Channel::new(receiver, channel));
+                    ports.push(port);
+                    channel += 1;
+                    if channel >= channels {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Some(ports.into())
+    }
+
+    pub fn auto_unroute(&mut self, receiver: usize) -> Vec<usize> {
+        let mut ports = Vec::new();
+        for port in 0..self.channels {
+            match self.mapping.entry(port) {
+                Entry::Occupied(e) => {
+                    if e.get().transceiver_id == receiver {
+                        e.remove();
+                        ports.push(port);
+                    }
+                }
+                Entry::Vacant(_) => continue,
+            }
+        }
+        ports.into()
+    }
+}
+
+impl InputMatrix {
+    pub fn default(channels: usize) -> InputMatrix {
+        let mapping = HashMap::new();
+        // for i in 0..inputs {
+        //     map.insert(Channel::new(i / 2, i % 2), i);
+        // }
+        InputMatrix { channels, mapping }
     }
 }
