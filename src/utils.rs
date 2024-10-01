@@ -252,7 +252,7 @@ pub fn set_realtime_priority() {
     if let Err(e) = set_thread_priority_and_policy(
         thread_native_id(),
         ThreadPriority::Max,
-        ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::RoundRobin),
+        ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::Fifo),
     ) {
         log::warn!("Could not set thread priority: {e}");
     } else {
