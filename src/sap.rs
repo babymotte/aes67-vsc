@@ -129,7 +129,7 @@ impl SapActor {
                             match session {
                                 Ok(sa) => {
                                     // TODO use customized key?
-                                    log::info!("Received SAP announcement …");
+                                    log::debug!("Received SAP announcement …");
                                     let key = topic!(root_key, "discovery", "sap", sa.originating_source.to_string(), sa.msg_id_hash, "sdp");
                                     if sa.deletion {
                                         log::debug!("SDP {} was deleted by {}.", sa.msg_id_hash, sa.originating_source);
