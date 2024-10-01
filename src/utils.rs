@@ -15,11 +15,15 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+use crate::rtp::RxDescriptor;
 use rtp_rs::{RtpReader, RtpReaderError, Seq};
 use std::{iter::Map, net::IpAddr, slice::Chunks, u16};
+use thread_priority::{
+    get_current_thread_priority, set_thread_priority_and_policy, thread_native_id,
+    thread_schedule_policy, unix, NormalThreadSchedulePolicy, RealtimeThreadSchedulePolicy,
+    ScheduleParams, ThreadPriority, ThreadPriorityOsValue, ThreadSchedulePolicy, NICENESS_MAX,
+};
 use tokio::{process::Command, spawn, sync::mpsc};
-
-use crate::rtp::RxDescriptor;
 
 pub(crate) struct RtpIter<'a> {
     consistent: Option<ConsistentRtpIterator<'a>>,
@@ -241,6 +245,18 @@ impl RtpSequenceBuffer {
         } else {
             None
         }
+    }
+}
+
+pub fn set_realtime_priority() {
+    if let Err(e) = set_thread_priority_and_policy(
+        thread_native_id(),
+        ThreadPriority::Max,
+        ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::RoundRobin),
+    ) {
+        log::warn!("Could not set thread priority: {e}");
+    } else {
+        log::info!("Successfully set real time priority for current thread.");
     }
 }
 

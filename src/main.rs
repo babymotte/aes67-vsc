@@ -19,11 +19,12 @@ mod actor;
 mod ui;
 
 use aes67_vsc::{
-    discovery_cleanup::{self, cleanup_discovery},
+    discovery_cleanup::cleanup_discovery,
     ptp::PtpApi,
     rtp::{RtpRxApi, RtpTxApi},
     sap::SapApi,
     status::StatusApi,
+    utils::set_realtime_priority,
 };
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
@@ -77,6 +78,8 @@ async fn main() -> Result<()> {
         .with_max_level(args.verbose.log_level_filter().as_trace())
         .with_env_filter(EnvFilter::from_default_env())
         .init();
+
+    set_realtime_priority();
 
     Toplevel::new(move |s| async move {
         s.start(SubsystemBuilder::new("aes67-vsc", |s| run(args, s)));
