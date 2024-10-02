@@ -30,6 +30,7 @@ import VolumeUpIcon from "@mui/icons-material/VolumeUp";
 import { useDeleteReceiver, useReceiveStream, WB_ROOT_KEY } from "../../api";
 import { parse, SessionDescription } from "sdp-transform";
 import VolumeOffIcon from "@mui/icons-material/VolumeOff";
+import { useNamespace } from "../../hooks";
 
 export default function DiscoveryList() {
   const sdps = usePSubscribe<string>(WB_ROOT_KEY + "/discovery/?/?/?/sdp");
@@ -47,8 +48,9 @@ function DiscoveryListItem({ sdp }: { sdp: string }) {
 
   const sessionId = parsedSdp.origin?.sessionId;
   const sessionVersion = parsedSdp.origin?.sessionVersion;
+  const ns = useNamespace();
   const receiver = useSubscribe<number>(
-    `${WB_ROOT_KEY}/status/sessions/${sessionId}/${sessionVersion}/receiver`
+    `${WB_ROOT_KEY}/${ns}/status/sessions/${sessionId}/${sessionVersion}/receiver`
   );
 
   const createReceiver = useReceiveStream(sdp);

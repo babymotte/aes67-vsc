@@ -17,12 +17,15 @@
 
 import axios from "axios";
 import React from "react";
-import { Config } from "worterbuch-react";
+import { ExtendedConfig } from "./hooks";
 
 export const WB_ROOT_KEY = "aes67-vsc";
 
-export function useWbConfig(): [Config | undefined, string | undefined] {
-  const [config, setConfig] = React.useState<Config | undefined>();
+export function useWbConfig(): [
+  ExtendedConfig | undefined,
+  string | undefined
+] {
+  const [config, setConfig] = React.useState<ExtendedConfig | undefined>();
   const [error, setError] = React.useState<string | undefined>();
   React.useEffect(() => {
     axios

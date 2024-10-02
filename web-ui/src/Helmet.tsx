@@ -18,6 +18,7 @@
 import React from "react";
 import { useWbConfig } from "./api";
 import { Worterbuch } from "worterbuch-react";
+import { NamespaceContext } from "./hooks";
 
 export default function Helmet({
   children,
@@ -25,17 +26,20 @@ export default function Helmet({
   children: React.JSX.Element | React.JSX.Element[];
 }) {
   const [config] = useWbConfig();
+  const namespace = config?.namespace;
 
   // TODO handle error
 
   return config ? (
-    <Worterbuch
-      automaticReconnect
-      clientName="AES67 Virtual Sound Card UI"
-      config={config}
-    >
-      {children}
-    </Worterbuch>
+    <NamespaceContext.Provider value={namespace}>
+      <Worterbuch
+        automaticReconnect
+        clientName="AES67 Virtual Sound Card UI"
+        config={config}
+      >
+        {children}
+      </Worterbuch>
+    </NamespaceContext.Provider>
   ) : (
     <>{children}</>
   );

@@ -121,6 +121,7 @@ pub async fn ui(
     wb: Worterbuch,
     wb_cfg: Config,
     open_web_ui: bool,
+    namespace: String,
 ) -> Result<()> {
     subsys.start(SubsystemBuilder::new("ui", move |s| async move {
         let webapp_root_dir =
@@ -138,7 +139,11 @@ pub async fn ui(
         }
 
         let (channel, ui_commands) = mpsc::channel(1000);
-        let ui_api = UiApi { channel, wb_cfg };
+        let ui_api = UiApi {
+            channel,
+            wb_cfg,
+            namespace,
+        };
 
         s.start(SubsystemBuilder::new("web-server", move |s| async move {
             let serve_dir = ServeDir::new(&webapp_root_dir)
@@ -200,6 +205,7 @@ enum UiFunction {
 struct UiApi {
     channel: mpsc::Sender<UiFunction>,
     wb_cfg: Config,
+    namespace: String,
 }
 
 impl ActorApi for UiApi {
@@ -227,7 +233,7 @@ impl UiApi {
             .await
     }
 
-    async fn wb_config_for_web(&self) -> WorterbuchConfig {
+    async fn wb_config_for_web(&self, namespace: String) -> WorterbuchConfig {
         let Config {
             host_addr,
             auth_token,
@@ -244,7 +250,12 @@ impl UiApi {
             backend_port: port,
             backend_path: "/ws".to_owned(),
             backend_auth_token: auth_token,
+            namespace,
         }
+    }
+
+    fn namespace(&self) -> String {
+        self.namespace.clone()
     }
 }
 
@@ -324,7 +335,7 @@ async fn delete_receiver(
 }
 
 async fn wb_config(State(ui_api): State<UiApi>) -> impl IntoResponse {
-    let config = ui_api.wb_config_for_web().await;
+    let config = ui_api.wb_config_for_web(ui_api.namespace()).await;
     Json(config)
 }
 
@@ -372,4 +383,5 @@ struct WorterbuchConfig {
     backend_port: Option<u16>,
     backend_path: String,
     backend_auth_token: Option<String>,
+    namespace: String,
 }

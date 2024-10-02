@@ -36,6 +36,7 @@ use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle, Toplevel};
 use tracing_log::AsTrace;
 use tracing_subscriber::EnvFilter;
 use ui::ui;
+use uuid::Uuid;
 use worterbuch_client::{connect_with_default_config, topic};
 
 #[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
@@ -105,24 +106,28 @@ async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
         .await
         .into_diagnostic()?;
 
-    // TODO get from config?
-    let wb_root_key = "aes67-vsc".to_owned();
+    // TODO should the namespace be persisted / loaded from persistence on start?
+    let hostname = hostname::get()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|_| Uuid::new_v4().to_string());
+    let wb_root_key = "aes67-vsc";
+    let wb_namespace_key = topic!(wb_root_key, hostname);
 
     wb.set_client_name(&wb_root_key).await.into_diagnostic()?;
 
-    wb.set_grave_goods(&[&topic!(wb_root_key, "status", "#")])
+    wb.set_grave_goods(&[&topic!(wb_namespace_key, "#")])
         .await
         .into_diagnostic()?;
 
-    let status =
-        StatusApi::new(&subsys, wb.clone(), wb_root_key.clone() + "/status").into_diagnostic()?;
+    let status = StatusApi::new(&subsys, wb.clone(), topic!(wb_namespace_key, "status"))
+        .into_diagnostic()?;
     let rtp_tx = RtpTxApi::new(&subsys).into_diagnostic()?;
     let rtp_rx = RtpRxApi::new(&subsys, args.inputs, link_offset, status.clone(), args.ip)
         .into_diagnostic()?;
-    let sap = SapApi::new(&subsys, wb.clone(), wb_root_key.clone()).into_diagnostic()?;
+    let sap = SapApi::new(&subsys, wb.clone(), wb_root_key.to_owned()).into_diagnostic()?;
     let ptp = PtpApi::new(&subsys).into_diagnostic()?;
 
-    cleanup_discovery(&subsys, wb.clone(), wb_root_key.clone());
+    cleanup_discovery(&subsys, wb.clone(), wb_root_key.to_owned());
 
     ui(
         &subsys,
@@ -134,6 +139,7 @@ async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
         wb.clone(),
         wb_cfg,
         args.ui,
+        hostname,
     )
     .await?;
 
