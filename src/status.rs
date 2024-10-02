@@ -51,6 +51,9 @@ pub enum Receiver {
     Meter(ReceiverId, usize, u16),
     BufferUnderrun(ReceiverId, u128),
     BufferOverflow(ReceiverId, u128),
+    BufferUsage(ReceiverId, usize, usize, usize),
+    DroppedPackets(ReceiverId, usize),
+    OutOfOrderPackets(ReceiverId, usize),
 }
 
 #[derive(Clone)]
@@ -69,7 +72,7 @@ impl ActorApi for StatusApi {
 
 impl StatusApi {
     pub fn new(subsys: &SubsystemHandle, wb: Worterbuch, root_key: String) -> StatusResult<Self> {
-        let (channel, commands) = mpsc::channel(1);
+        let (channel, commands) = mpsc::channel(1000);
 
         subsys.start(SubsystemBuilder::new("status", |s| async move {
             let mut actor = StatusActor::new(commands, wb, root_key);
@@ -181,31 +184,31 @@ impl StatusActor {
                 Receiver::Created(desc, sdp) => {
                     let mut vec = vec![
                         (
-                            topic!("receivers", desc.id, "bitDepth"),
+                            topic!("receivers", desc.id, "config", "bitDepth"),
                             json!(desc.bit_depth),
                         ),
                         (
-                            topic!("receivers", desc.id, "channels"),
+                            topic!("receivers", desc.id, "config", "channels"),
                             json!(desc.channels),
                         ),
                         (
-                            topic!("receivers", desc.id, "packetTimeMs"),
+                            topic!("receivers", desc.id, "config", "packetTimeMs"),
                             json!(desc.packet_time),
                         ),
                         (
-                            topic!("receivers", desc.id, "sampleRate"),
+                            topic!("receivers", desc.id, "config", "sampleRate"),
                             json!(desc.sampling_rate),
                         ),
                         (
-                            topic!("receivers", desc.id, "session", "id"),
+                            topic!("receivers", desc.id, "config", "session", "id"),
                             json!(desc.session_id),
                         ),
                         (
-                            topic!("receivers", desc.id, "session", "version"),
+                            topic!("receivers", desc.id, "config", "session", "version"),
                             json!(desc.session_version),
                         ),
                         (
-                            topic!("receivers", desc.id, "session", "name"),
+                            topic!("receivers", desc.id, "config", "session", "name"),
                             json!(desc.session_name),
                         ),
                         (
@@ -223,7 +226,7 @@ impl StatusActor {
                         ),
                     ];
                     if let Some(sdp) = sdp {
-                        vec.push((topic!("receivers", desc.id, "sdp"), json!(sdp)));
+                        vec.push((topic!("receivers", desc.id, "config", "sdp"), json!(sdp)));
                     }
                     Action::Set(vec)
                 }
@@ -254,17 +257,33 @@ impl StatusActor {
                 Receiver::Sdp(id, value) => {
                     Action::Set(vec![(topic!("receivers", id, "sdp"), json!(value))])
                 }
-                Receiver::Meter(id, channel, value) => Action::Set(vec![(
+                Receiver::Meter(id, channel, value) => Action::Publish(vec![(
                     topic!("receivers", id, "meter", channel),
                     json!(value),
                 )]),
-                Receiver::BufferUnderrun(id, value) => Action::Set(vec![(
+                Receiver::BufferUnderrun(id, value) => Action::Publish(vec![(
                     topic!("receivers", id, "buffer", "underrun"),
                     json!(value),
                 )]),
-                Receiver::BufferOverflow(id, value) => Action::Set(vec![(
+                Receiver::BufferOverflow(id, value) => Action::Publish(vec![(
                     topic!("receivers", id, "buffer", "overflow"),
                     json!(value),
+                )]),
+                Receiver::BufferUsage(id, used, size, percent) => Action::Publish(vec![
+                    (topic!("receivers", id, "buffer", "size"), json!(size)),
+                    (topic!("receivers", id, "buffer", "used"), json!(used)),
+                    (
+                        topic!("receivers", id, "buffer", "used", "percent"),
+                        json!(percent),
+                    ),
+                ]),
+                Receiver::DroppedPackets(id, count) => Action::Publish(vec![(
+                    topic!("receivers", id, "packets", "dropped"),
+                    json!(count),
+                )]),
+                Receiver::OutOfOrderPackets(id, count) => Action::Publish(vec![(
+                    topic!("receivers", id, "packets", "outOfOrder"),
+                    json!(count),
                 )]),
             },
         }

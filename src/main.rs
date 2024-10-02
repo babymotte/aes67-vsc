@@ -113,11 +113,41 @@ async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
     let wb_root_key = "aes67-vsc";
     let wb_namespace_key = topic!(wb_root_key, hostname);
 
-    wb.set_client_name(&wb_root_key).await.into_diagnostic()?;
+    wb.set_client_name(&wb_namespace_key)
+        .await
+        .into_diagnostic()?;
 
     wb.set_grave_goods(&[&topic!(wb_namespace_key, "#")])
         .await
         .into_diagnostic()?;
+
+    wb.set(
+        topic!(wb_namespace_key, "config", "audio", "linkOffsetMs"),
+        args.link_offset,
+    )
+    .await
+    .into_diagnostic()?;
+    wb.set(
+        topic!(wb_namespace_key, "config", "io", "inputs"),
+        args.inputs,
+    )
+    .await
+    .into_diagnostic()?;
+    wb.set(
+        topic!(wb_namespace_key, "config", "io", "outputs"),
+        args.outputs,
+    )
+    .await
+    .into_diagnostic()?;
+    wb.set(topic!(wb_namespace_key, "config", "network", "ip"), args.ip)
+        .await
+        .into_diagnostic()?;
+    wb.set(
+        topic!(wb_namespace_key, "config", "network", "port"),
+        args.port,
+    )
+    .await
+    .into_diagnostic()?;
 
     let status = StatusApi::new(&subsys, wb.clone(), topic!(wb_namespace_key, "status"))
         .into_diagnostic()?;

@@ -15,7 +15,7 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-mod audio_system;
+pub(crate) mod audio_system;
 mod rx;
 mod socket;
 mod tx;

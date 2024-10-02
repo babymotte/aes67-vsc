@@ -16,7 +16,8 @@
  */
 
 use super::{
-    AudioSystem, Event, Message, ReceiverBufferInitCallback, TransmitterBufferInitCallback,
+    AudioSystem, Message, OutputEvent, ReceiverBufferInitCallback, RtpSample,
+    TransmitterBufferInitCallback,
 };
 use crate::{
     error::RtpResult,
@@ -44,9 +45,9 @@ struct State {
     out_ports: Vec<Port<AudioOut>>,
     _transmitters: Option<Box<[mpsc::Sender<f32>]>>,
     _transmitter_init: TransmitterBufferInitCallback<f32>,
-    receivers: Option<Box<[mpsc::Receiver<f32>]>>,
+    receivers: Option<Box<[mpsc::Receiver<RtpSample<f32>>]>>,
     receiver_init: ReceiverBufferInitCallback<f32>,
-    status: mpsc::Sender<Event>,
+    status: mpsc::Sender<OutputEvent>,
     msg_rx: mpsc::Receiver<Message>,
     active_inputs: Box<[bool]>,
     active_outputs: Box<[bool]>,
@@ -59,7 +60,7 @@ impl JackAudioSystem {
         _transmitter_init: TransmitterBufferInitCallback<f32>,
         receivers: usize,
         receiver_init: ReceiverBufferInitCallback<f32>,
-        status: mpsc::Sender<Event>,
+        status: mpsc::Sender<OutputEvent>,
         msg_rx: mpsc::Receiver<Message>,
     ) -> RtpResult<Self> {
         let active_inputs = init_buffer(transmitters, |_| false);
@@ -183,13 +184,18 @@ fn process(state: &mut State, _client: &Client, ps: &ProcessScope) -> Control {
                 let mut last = 0.0;
                 for (i, sample) in buffer.iter_mut().enumerate() {
                     match recv.try_recv() {
-                        Ok(value) => {
+                        // TODO if playout time has already passed, continue to pull samples until playout time is reached
+                        // TODO if playout time is in the future, remember it and fill buffer with silence until it arrives
+                        Ok(RtpSample(_playout_time, value)) => {
                             last = value;
                             *sample = value;
                         }
                         Err(e) => match e {
                             TryRecvError::Empty => {
-                                state.status.try_send(Event::BufferUnderrun(port_nr)).ok();
+                                state
+                                    .status
+                                    .try_send(OutputEvent::BufferUnderrun(port_nr))
+                                    .ok();
                                 silence(buffer, last, i);
                                 break;
                             }

@@ -21,6 +21,9 @@ pub(crate) use jack::JackAudioSystem;
 
 use tokio::sync::{mpsc, oneshot};
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RtpSample<S>(pub u128, pub S);
+
 pub(crate) trait AudioSystem {
     type SampleFormat;
 
@@ -34,12 +37,12 @@ pub(crate) type TransmitterBufferInitCallback<S> =
 //     mpsc::Receiver<(usize, oneshot::Sender<Box<[mpsc::Receiver<S>]>>)>;
 
 pub(crate) type ReceiverBufferInitCallback<S> =
-    mpsc::Sender<(usize, oneshot::Sender<Box<[mpsc::Receiver<S>]>>)>;
+    mpsc::Sender<(usize, oneshot::Sender<Box<[mpsc::Receiver<RtpSample<S>>]>>)>;
 
 // pub(crate) type ReceiverBufferInitCallbackReceiver<S> =
 //     mpsc::Receiver<(usize, oneshot::Sender<Box<[mpsc::Receiver<S>]>>)>;
 
-pub(crate) enum Event {
+pub(crate) enum OutputEvent {
     BufferUnderrun(usize),
 }
 
