@@ -234,11 +234,14 @@ impl UiApi {
             ..
         } = self.wb_cfg.clone();
 
+        let port = env::var("WORTERBUCH_WS_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok());
+
         WorterbuchConfig {
             backend_scheme: "ws".to_owned(),
             backend_host: host_addr,
-            // TODO use port from config
-            backend_port: Some(80),
+            backend_port: port,
             backend_path: "/ws".to_owned(),
             backend_auth_token: auth_token,
         }
