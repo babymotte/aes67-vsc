@@ -21,7 +21,8 @@ use super::{
 };
 use crate::{
     error::RtpResult,
-    utils::{init_buffer, set_realtime_priority},
+    rtp::RxDescriptor,
+    utils::{init_buffer, set_realtime_priority, MediaClockTimestamp},
 };
 use jack::{
     contrib::ClosureProcessHandler, AudioIn, AudioOut, Client, ClientOptions, Control, Frames,
@@ -50,7 +51,9 @@ struct State {
     status: mpsc::Sender<OutputEvent>,
     msg_rx: mpsc::Receiver<Message>,
     active_inputs: Box<[bool]>,
-    active_outputs: Box<[bool]>,
+    active_outputs: Box<[Option<RxDescriptor>]>,
+    pending_samples: Box<[Option<RtpSample<f32>>]>,
+    media_clocks: Box<[Option<MediaClockTimestamp>]>,
 }
 
 impl JackAudioSystem {
@@ -64,7 +67,7 @@ impl JackAudioSystem {
         msg_rx: mpsc::Receiver<Message>,
     ) -> RtpResult<Self> {
         let active_inputs = init_buffer(transmitters, |_| false);
-        let active_outputs = init_buffer(receivers, |_| false);
+        let active_outputs = init_buffer(receivers, |_| None);
 
         // TODO evaluate client status
         let (client, _status) = Client::new(CLIENT_NAME, ClientOptions::default())?;
@@ -81,6 +84,8 @@ impl JackAudioSystem {
             out_ports.push(client.register_port(&format!("out{}", i + 1), AudioOut::default())?);
         }
 
+        let pending_samples = init_buffer(receivers, |_| None);
+        let timestamps = init_buffer(receivers, |_| None);
         let _transmitters = None;
         let receivers = None;
 
@@ -96,6 +101,8 @@ impl JackAudioSystem {
                 active_inputs,
                 active_outputs,
                 msg_rx,
+                pending_samples,
+                media_clocks: timestamps,
             },
             process,
             init_buffers,
@@ -179,16 +186,73 @@ fn process(state: &mut State, _client: &Client, ps: &ProcessScope) -> Control {
         for (port_nr, port) in state.out_ports.iter_mut().enumerate() {
             let buffer = port.as_mut_slice(ps);
 
-            if state.active_outputs[port_nr] {
+            if let Some(desc) = &state.active_outputs[port_nr] {
                 let recv = &mut receivers[port_nr];
                 let mut last = 0.0;
-                for (i, sample) in buffer.iter_mut().enumerate() {
-                    match recv.try_recv() {
-                        // TODO if playout time has already passed, continue to pull samples until playout time is reached
-                        // TODO if playout time is in the future, remember it and fill buffer with silence until it arrives
-                        Ok(RtpSample(_playout_time, value)) => {
+
+                let mut index = 0;
+
+                let mut media_clock = if let Some(it) = state.media_clocks[port_nr].take() {
+                    it
+                } else {
+                    // media clock has not been initialized, create a new one based on system time
+                    MediaClockTimestamp::now(&desc)
+                };
+
+                while index < buffer.len() {
+                    let next = if let Some(it) = state.pending_samples[port_nr].take() {
+                        Ok(it)
+                    } else {
+                        recv.try_recv()
+                    };
+
+                    match next {
+                        Ok(RtpSample(playout_time, value)) => {
+                            if playout_time < media_clock {
+                                // packet is too late, discard it and continue pulling
+                                // TODO report buffer overflow
+                                // TODO if this is not the first sample of the buffer, report a lost packet
+                                // log::warn!("sample is late: {playout_time:?} < {media_time:?}");
+                                continue;
+                            } else if playout_time > media_clock {
+                                let diff = (playout_time - media_clock) as usize;
+                                let destination = index + diff;
+                                if destination < buffer.len() {
+                                    // sample belongs in this buffer, we just need to jump ahead a bit
+                                    log::warn!(
+                                        "sample is early: {playout_time} > {media_clock} - skipping {diff} samples"
+                                    );
+                                    // fill buffer up to playout time with silence
+                                    for i in index..destination {
+                                        buffer[i] = last;
+                                    }
+                                    // advance index to playout time
+                                    index = destination;
+                                    // advance media clock to playout time
+                                    media_clock = playout_time;
+                                    // TODO if this is not the first sample of the buffer, report a lost packet
+                                } else {
+                                    // sample belongs in the next buffer, we play out silence for now and try again later
+                                    // TODO report buffer underrun
+                                    // TODO if this is not the first sample of the buffer, report a lost packet
+                                    log::warn!(
+                                        "sample is early: {playout_time} > {media_clock} - waiting for next buffer"
+                                    );
+                                    state.pending_samples[port_nr] =
+                                        Some(RtpSample(playout_time, value));
+                                    silence(buffer, last, index);
+                                    break;
+                                }
+                            }
+
+                            buffer[index] = value;
                             last = value;
-                            *sample = value;
+                            index += 1;
+                            media_clock = media_clock.next();
+                            state.media_clocks[port_nr] = Some(media_clock);
+                            if index == buffer.len() {
+                                break;
+                            }
                         }
                         Err(e) => match e {
                             TryRecvError::Empty => {
@@ -196,15 +260,15 @@ fn process(state: &mut State, _client: &Client, ps: &ProcessScope) -> Control {
                                     .status
                                     .try_send(OutputEvent::BufferUnderrun(port_nr))
                                     .ok();
-                                silence(buffer, last, i);
+                                silence(buffer, last, index);
                                 break;
                             }
                             TryRecvError::Disconnected => {
-                                silence(buffer, last, i);
+                                silence(buffer, last, index);
                                 break;
                             }
                         },
-                    }
+                    };
                 }
             } else {
                 silence(buffer, 0.0, 0);

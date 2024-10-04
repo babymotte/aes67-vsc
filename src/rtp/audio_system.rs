@@ -21,8 +21,12 @@ pub(crate) use jack::JackAudioSystem;
 
 use tokio::sync::{mpsc, oneshot};
 
+use crate::utils::MediaClockTimestamp;
+
+use super::RxDescriptor;
+
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct RtpSample<S>(pub u128, pub S);
+pub(crate) struct RtpSample<S>(pub MediaClockTimestamp, pub S);
 
 pub(crate) trait AudioSystem {
     type SampleFormat;
@@ -48,5 +52,5 @@ pub(crate) enum OutputEvent {
 
 pub(crate) enum Message {
     ActiveInputsChanged(Box<[bool]>),
-    ActiveOutputsChanged(Box<[bool]>),
+    ActiveOutputsChanged(Box<[Option<RxDescriptor>]>),
 }

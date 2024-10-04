@@ -28,6 +28,8 @@ use crate::{
     ReceiverId,
 };
 use core::f32;
+use lazy_static::lazy_static;
+use regex::Regex;
 use sdp::{
     description::common::{Address, ConnectionInformation},
     SessionDescription,
@@ -49,6 +51,16 @@ use tokio::{
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
 use tokio_util::sync::CancellationToken;
 
+lazy_static! {
+    static ref MEDIA_REGEX: Regex =
+        Regex::new(r"audio (.+) (.+) (.+)").expect("no dynammic input, can't fail");
+    static ref RTPMAP_REGEX: Regex = Regex::new(r"([0-9]+) .+?([0-9]+)\/([0-9]+)\/([0-9]+)")
+        .expect("no dynammic input, can't fail");
+    static ref TS_REFCLK_REGEX: Regex =
+        Regex::new(r"ptp=(.+):(.+):(.+)").expect("no dynammic input, can't fail");
+    static ref MEDIACLK_REGEX: Regex =
+        Regex::new(r"direct=([0-9]+)").expect("no dynammic input, can't fail");
+}
 #[derive(Debug, Clone)]
 pub struct RxDescriptor {
     pub id: usize,
@@ -61,6 +73,7 @@ pub struct RxDescriptor {
     pub packet_time: f32,
     pub link_offset: f32,
     pub origin_ip: IpAddr,
+    pub rtp_offset: u32,
 }
 
 impl RxDescriptor {
@@ -84,27 +97,23 @@ impl RxDescriptor {
             return Err(RxError::InvalidSdp("no rtpmap found".to_owned()));
         };
 
-        if !rtpmap.starts_with(fmt) {
+        let (payload_type, bit_depth, sampling_rate, channels) =
+            if let Some(caps) = RTPMAP_REGEX.captures(rtpmap) {
+                (
+                    caps[1].to_owned(),
+                    caps[2].parse().expect("regex guarantees this is a number"),
+                    caps[3].parse().expect("regex guarantees this is a number"),
+                    caps[4].parse().expect("regex guarantees this is a number"),
+                )
+            } else {
+                return Err(RxError::InvalidSdp("malformed rtpmap".to_owned()));
+            };
+
+        if &payload_type != fmt {
             return Err(RxError::InvalidSdp(
                 "rtpmap and media description payload types do not match".to_owned(),
             ));
         }
-
-        let stream_format = rtpmap.replace(fmt, "").trim().to_owned();
-
-        let mut split = stream_format.split('/');
-        let (bit_depth, sampling_rate, channels): (usize, usize, usize) =
-            if let (Some(bit_depth), Some(sampling_rate), Some(channels)) = (
-                split.next().and_then(|it| it[1..].parse().ok()),
-                split.next().and_then(|it| it.parse().ok()),
-                split.next().and_then(|it| it.parse().ok()),
-            ) {
-                (bit_depth, sampling_rate, channels)
-            } else {
-                return Err(RxError::InvalidSdp(
-                    "could not get bit depth, sampling rate and channels from rtpmap".to_owned(),
-                ));
-            };
 
         let packet_time = if let Some(ptime) = media
             .attribute("ptime")
@@ -114,6 +123,18 @@ impl RxDescriptor {
             ptime
         } else {
             return Err(RxError::InvalidSdp("no ptime".to_owned()));
+        };
+
+        let mediaclk = if let Some(it) = media.attribute("mediaclk").and_then(|it| it) {
+            it
+        } else {
+            return Err(RxError::InvalidSdp("mediaclk".to_owned()));
+        };
+
+        let rtp_offset = if let Some(caps) = MEDIACLK_REGEX.captures(mediaclk) {
+            caps[1].parse().expect("regex guarantees this is a number")
+        } else {
+            return Err(RxError::InvalidSdp("malformed mediaclk".to_owned()));
         };
 
         let session_name = sd.session_name.clone();
@@ -136,6 +157,7 @@ impl RxDescriptor {
             packet_time,
             link_offset,
             origin_ip,
+            rtp_offset,
         })
     }
 
@@ -336,7 +358,7 @@ where
     matrix: OutputMatrix,
     port_txs: Box<[Option<mpsc::Sender<RtpSample<SampleFormat>>>]>,
     local_ip: Option<IpAddr>,
-    active_ports: Box<[bool]>,
+    active_ports: Box<[Option<RxDescriptor>]>,
     msg_tx: mpsc::Sender<Message>,
     output_event_rx: mpsc::Receiver<OutputEvent>,
 }
@@ -415,7 +437,7 @@ where
         let active_receivers = init_buffer(max_channels, |_| None);
         let matrix = OutputMatrix::default(max_channels);
         let port_txs = init_buffer(max_channels, |_| None);
-        let active_ports = init_buffer(max_channels, |_| false);
+        let active_ports = init_buffer(max_channels, |_| None);
 
         RtpRxActor {
             subsys,
@@ -442,7 +464,7 @@ where
         match event {
             OutputEvent::BufferUnderrun(port) => {
                 log::debug!("Buffer underrun in output {port}");
-                if let Some(ch) = self.matrix.mapping.get(&port) {
+                if let Some((ch, _)) = self.matrix.mapping.get(&port) {
                     self.status
                         .publish(Status::Receiver(Receiver::BufferUnderrun(
                             ch.transceiver_id,
@@ -520,7 +542,7 @@ where
 
         let changed_ports = self
             .matrix
-            .auto_route(receiver_id, desc.channels)
+            .auto_route(receiver_id, desc.channels, desc.clone())
             .expect("port availability must be checked first");
 
         self.activate_ports(changed_ports).await?;
@@ -558,7 +580,7 @@ where
         let mut mapping = vec![vec![]; desc.channels];
 
         for ch_nr in 0..desc.channels {
-            for (port, ch) in &self.matrix.mapping {
+            for (port, (ch, _)) in &self.matrix.mapping {
                 if ch.transceiver_id == desc.id && ch_nr == ch.channel_nr {
                     if let Some(tx) = &self.port_txs[*port] {
                         mapping[ch_nr].push(tx.to_owned());
@@ -625,7 +647,14 @@ where
 
     async fn activate_ports(&mut self, changed_ports: Vec<usize>) -> RxResult<()> {
         for port in changed_ports {
-            self.active_ports[port] = true;
+            self.active_ports[port] = Some(
+                self.matrix
+                    .mapping
+                    .get(&port)
+                    .expect("no descriptor for active port")
+                    .1
+                    .clone(),
+            );
         }
         self.msg_tx
             .send(Message::ActiveOutputsChanged(self.active_ports.clone()))
@@ -636,7 +665,7 @@ where
 
     async fn deactivate_ports(&mut self, changed_ports: Vec<usize>) -> RxResult<()> {
         for port in changed_ports {
-            self.active_ports[port] = false;
+            self.active_ports[port] = None;
         }
         self.msg_tx
             .send(Message::ActiveOutputsChanged(self.active_ports.clone()))
@@ -791,13 +820,14 @@ struct ReceiveLoop<S: Copy> {
     updates: mpsc::Receiver<ReceiverMessage<RtpSample<S>>>,
     socket: UdpSocket,
     rtp_buffer: Box<[u8]>,
-    sequence_buffer: RtpSequenceBuffer<S>,
+    sequence_buffer: RtpSequenceBuffer,
     port_transmitters: Box<[Box<[mpsc::Sender<RtpSample<S>>]>]>,
     min_buffer_usage: (usize, usize),
     status: StatusApi,
     event_rx: mpsc::UnboundedReceiver<utils::SequenceBufferEvent>,
     out_of_order_packets: usize,
     dropped_packets: usize,
+    sample_reader: fn(&[u8]) -> S,
 }
 
 impl<S> ReceiveLoop<S>
@@ -813,7 +843,7 @@ where
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let rtp_buffer = init_buffer(desc.rtp_packet_size(), |_| 0u8);
-        let sequence_buffer = RtpSequenceBuffer::new(desc.clone(), sample_reader, event_tx);
+        let sequence_buffer = RtpSequenceBuffer::new(desc.clone(), event_tx);
         let port_transmitters = init_buffer(desc.channels, |_| vec![].into());
 
         Self {
@@ -828,11 +858,12 @@ where
             event_rx,
             out_of_order_packets: 0,
             dropped_packets: 0,
+            sample_reader,
         }
     }
 
     async fn run(mut self) {
-        let mut interval = interval(Duration::from_secs(1));
+        let mut interval = interval(Duration::from_millis(100));
         loop {
             select! {
                 Some(update) = self.updates.recv() => if !self.apply_update(update).await {
@@ -856,15 +887,27 @@ where
     async fn process_packet(&mut self, len: usize, addr: SocketAddr) {
         self.update_buffer_usage();
         if addr.ip() == self.desc.origin_ip {
-            let audio_data = self.sequence_buffer.update(&self.rtp_buffer[0..len]);
-            for (i, sample) in audio_data.into_iter().enumerate() {
-                let channel = i % self.desc.channels;
-                let port_transmitters = &self.port_transmitters[channel];
-                for port_tx in port_transmitters {
-                    port_tx.send(*sample).await.ok();
+            let packets = self.sequence_buffer.update(&self.rtp_buffer[0..len]);
+            for packet in packets.iter_mut() {
+                let mut timestamp = packet.timestamp;
+                for (i, raw_sample) in packet
+                    .payload
+                    .chunks(self.desc.bytes_per_sample())
+                    .enumerate()
+                {
+                    let sample = (self.sample_reader)(raw_sample);
+                    let channel = i % self.desc.channels;
+                    let playout_time = timestamp.playout_time();
+                    let port_transmitters = &self.port_transmitters[channel];
+                    for port_tx in port_transmitters {
+                        port_tx.send(RtpSample(playout_time, sample)).await.ok();
+                    }
+                    if channel == self.desc.channels - 1 {
+                        timestamp = timestamp.next();
+                    }
                 }
             }
-            audio_data.clear();
+            packets.clear();
         } else {
             log::warn!("Received packet from wrong sender: {addr}");
         }
@@ -875,7 +918,6 @@ where
             ReceiverMessage::ChannelMapping(mapping) => {
                 self.reset_buffer_usage();
                 self.port_transmitters = mapping;
-                self.sequence_buffer.reset();
             }
             ReceiverMessage::Stop => return false,
         }

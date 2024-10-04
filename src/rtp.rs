@@ -47,7 +47,7 @@ impl Channel {
 #[derive(Debug, Clone)]
 pub struct OutputMatrix {
     channels: usize,
-    mapping: HashMap<usize, Channel>,
+    mapping: HashMap<usize, (Channel, RxDescriptor)>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,7 +65,12 @@ impl OutputMatrix {
         OutputMatrix { channels, mapping }
     }
 
-    pub fn auto_route(&mut self, receiver: usize, channels: usize) -> Option<Vec<usize>> {
+    pub fn auto_route(
+        &mut self,
+        receiver: usize,
+        channels: usize,
+        desc: RxDescriptor,
+    ) -> Option<Vec<usize>> {
         if self.channels - self.mapping.len() < channels {
             return None;
         }
@@ -77,7 +82,7 @@ impl OutputMatrix {
             match self.mapping.entry(port) {
                 Entry::Occupied(_) => continue,
                 Entry::Vacant(e) => {
-                    e.insert(Channel::new(receiver, channel));
+                    e.insert((Channel::new(receiver, channel), desc.clone()));
                     ports.push(port);
                     channel += 1;
                     if channel >= channels {
@@ -95,7 +100,7 @@ impl OutputMatrix {
         for port in 0..self.channels {
             match self.mapping.entry(port) {
                 Entry::Occupied(e) => {
-                    if e.get().transceiver_id == receiver {
+                    if e.get().0.transceiver_id == receiver {
                         e.remove();
                         ports.push(port);
                     }

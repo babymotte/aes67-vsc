@@ -53,7 +53,7 @@ impl SapApi {
 
         subsys.start(SubsystemBuilder::new("sap", |s| async move {
             let token = s.create_cancellation_token();
-            let mut actor = SapActor::new(s, messages, wb.clone());
+            let mut actor = SapActor::new(s, messages);
             actor.start_discovery(wb.clone(), root_key).await?;
             actor.run("sap".to_owned(), token).await
         }));
@@ -85,7 +85,6 @@ struct SapActor {
     subsys: SubsystemHandle,
     sessions: HashMap<String, oneshot::Sender<()>>,
     messages: mpsc::Receiver<SapFunction>,
-    wb: Worterbuch,
 }
 
 impl Actor for SapActor {
@@ -105,13 +104,12 @@ impl Actor for SapActor {
 }
 
 impl SapActor {
-    fn new(subsys: SubsystemHandle, messages: mpsc::Receiver<SapFunction>, wb: Worterbuch) -> Self {
+    fn new(subsys: SubsystemHandle, messages: mpsc::Receiver<SapFunction>) -> Self {
         let sessions = HashMap::new();
         SapActor {
             sessions,
             subsys,
             messages,
-            wb,
         }
     }
 

@@ -1,1 +1,1 @@
-{"root":["./src/App.tsx","./src/Helmet.tsx","./src/api.ts","./src/main.tsx","./src/vite-env.d.ts","./src/components/create_sender/CreateReceiverForm.tsx","./src/components/create_sender/DiscoveryList.tsx"],"version":"5.6.2"}
+{"root":["./src/App.tsx","./src/Helmet.tsx","./src/api.ts","./src/hooks.ts","./src/main.tsx","./src/vite-env.d.ts","./src/components/create_sender/CreateReceiverForm.tsx","./src/components/create_sender/DiscoveryList.tsx"],"version":"5.6.2"}
