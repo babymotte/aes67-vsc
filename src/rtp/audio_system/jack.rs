@@ -192,6 +192,8 @@ fn process(state: &mut State, _client: &Client, ps: &ProcessScope) -> Control {
 
                 let mut index = 0;
 
+                // TODO move media clock and buffer mapping out of audio system into RTP receiver
+
                 let mut media_clock = if let Some(it) = state.media_clocks[port_nr].take() {
                     it
                 } else {
@@ -216,7 +218,7 @@ fn process(state: &mut State, _client: &Client, ps: &ProcessScope) -> Control {
                                     // sample belongs in this buffer, we just need to jump back a bit
                                     // TODO reduce log level
                                     log::warn!(
-                                        "sample is late: {playout_time} < {media_clock} - backtracking {diff} samples"
+                                        "sample is {} frames late ({playout_time} < {media_clock}) - backtracking {diff} samples", -diff
                                     );
                                     // reset index to playout time
                                     index = destination as usize;
@@ -226,7 +228,7 @@ fn process(state: &mut State, _client: &Client, ps: &ProcessScope) -> Control {
                                     // sample belonged to previous buffer, nothing we can do here
                                     // TODO report dropped packet
                                     log::warn!(
-                                        "sample is late: {playout_time} < {media_clock} - dropping it"
+                                        "sample is {} frames late ({playout_time} < {media_clock}) - dropping it", -diff
                                     );
                                     continue;
                                 }
@@ -237,7 +239,7 @@ fn process(state: &mut State, _client: &Client, ps: &ProcessScope) -> Control {
                                     // sample belongs in this buffer, we just need to jump ahead a bit
                                     // TODO reduce log level
                                     log::warn!(
-                                        "sample is early: {playout_time} > {media_clock} - skipping {diff} samples"
+                                        "sample is {diff} frames early ({playout_time} > {media_clock}) - skipping {diff} samples"
                                     );
                                     // fill buffer up to playout time with silence in case we don't backtrack
                                     for i in index..destination {
@@ -251,7 +253,7 @@ fn process(state: &mut State, _client: &Client, ps: &ProcessScope) -> Control {
                                     // sample belongs in the next buffer, we play out silence for now and try again later
                                     // TODO report buffer underrun
                                     log::warn!(
-                                        "sample is early: {playout_time} > {media_clock} - waiting for next buffer"
+                                        "sample is {diff} frames early ({playout_time} > {media_clock}) - waiting for next buffer"
                                     );
                                     state.pending_samples[port_nr] =
                                         Some(RtpSample(playout_time, value));
