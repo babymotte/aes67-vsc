@@ -208,21 +208,38 @@ fn process(state: &mut State, _client: &Client, ps: &ProcessScope) -> Control {
 
                     match next {
                         Ok(RtpSample(playout_time, value)) => {
+                            // TODO check if all expected samples have arrived and report lost packet if not
                             if playout_time < media_clock {
-                                // packet is too late, discard it and continue pulling
-                                // TODO report buffer overflow
-                                // TODO if this is not the first sample of the buffer, report a lost packet
-                                // log::warn!("sample is late: {playout_time:?} < {media_time:?}");
-                                continue;
+                                let diff = playout_time - media_clock;
+                                let destination = index as i64 + diff;
+                                if destination > 0 {
+                                    // sample belongs in this buffer, we just need to jump back a bit
+                                    // TODO reduce log level
+                                    log::warn!(
+                                        "sample is late: {playout_time} < {media_clock} - backtracking {diff} samples"
+                                    );
+                                    // reset index to playout time
+                                    index = destination as usize;
+                                    // reset media clock to playout time
+                                    media_clock = playout_time;
+                                } else {
+                                    // sample belonged to previous buffer, nothing we can do here
+                                    // TODO report dropped packet
+                                    log::warn!(
+                                        "sample is late: {playout_time} < {media_clock} - dropping it"
+                                    );
+                                    continue;
+                                }
                             } else if playout_time > media_clock {
                                 let diff = (playout_time - media_clock) as usize;
                                 let destination = index + diff;
                                 if destination < buffer.len() {
                                     // sample belongs in this buffer, we just need to jump ahead a bit
+                                    // TODO reduce log level
                                     log::warn!(
                                         "sample is early: {playout_time} > {media_clock} - skipping {diff} samples"
                                     );
-                                    // fill buffer up to playout time with silence
+                                    // fill buffer up to playout time with silence in case we don't backtrack
                                     for i in index..destination {
                                         buffer[i] = last;
                                     }
@@ -230,11 +247,9 @@ fn process(state: &mut State, _client: &Client, ps: &ProcessScope) -> Control {
                                     index = destination;
                                     // advance media clock to playout time
                                     media_clock = playout_time;
-                                    // TODO if this is not the first sample of the buffer, report a lost packet
                                 } else {
                                     // sample belongs in the next buffer, we play out silence for now and try again later
                                     // TODO report buffer underrun
-                                    // TODO if this is not the first sample of the buffer, report a lost packet
                                     log::warn!(
                                         "sample is early: {playout_time} > {media_clock} - waiting for next buffer"
                                     );
