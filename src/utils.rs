@@ -16,11 +16,9 @@
  */
 
 mod buffers;
-mod rtp;
 mod time;
 
 pub(crate) use buffers::*;
-pub(crate) use rtp::*;
 pub(crate) use time::*;
 
 use std::net::IpAddr;

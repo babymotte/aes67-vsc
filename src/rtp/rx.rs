@@ -24,12 +24,13 @@ use crate::{
     actor::{respond, Actor, ActorApi},
     error::{RxError, RxResult},
     status::{Receiver, Status, StatusApi},
-    utils::{self, init_buffer, RtpSequenceBuffer, SequenceBufferEvent},
+    utils::{self, init_buffer, MediaClockTimestamp},
     ReceiverId,
 };
 use core::f32;
 use lazy_static::lazy_static;
 use regex::Regex;
+use rtp_rs::RtpReader;
 use sdp::{
     description::common::{Address, ConnectionInformation},
     SessionDescription,
@@ -820,11 +821,9 @@ struct ReceiveLoop<S: Copy> {
     updates: mpsc::Receiver<ReceiverMessage<RtpSample<S>>>,
     socket: UdpSocket,
     rtp_buffer: Box<[u8]>,
-    sequence_buffer: RtpSequenceBuffer,
     port_transmitters: Box<[Box<[mpsc::Sender<RtpSample<S>>]>]>,
     min_buffer_usage: (usize, usize),
     status: StatusApi,
-    event_rx: mpsc::UnboundedReceiver<utils::SequenceBufferEvent>,
     out_of_order_packets: usize,
     dropped_packets: usize,
     sample_reader: fn(&[u8]) -> S,
@@ -841,9 +840,7 @@ where
         sample_reader: fn(&[u8]) -> S,
         status: StatusApi,
     ) -> Self {
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
         let rtp_buffer = init_buffer(desc.rtp_packet_size(), |_| 0u8);
-        let sequence_buffer = RtpSequenceBuffer::new(desc.clone(), event_tx);
         let port_transmitters = init_buffer(desc.channels, |_| vec![].into());
 
         Self {
@@ -851,11 +848,9 @@ where
             updates,
             socket,
             rtp_buffer,
-            sequence_buffer,
             port_transmitters,
             min_buffer_usage: (0, 0),
             status,
-            event_rx,
             out_of_order_packets: 0,
             dropped_packets: 0,
             sample_reader,
@@ -870,28 +865,19 @@ where
                     break;
                 },
                 Ok((len, addr)) = self.socket.recv_from(&mut self.rtp_buffer) => self.process_packet(len, addr).await,
-                Some(event) = self.event_rx.recv() => self.process_event(event),
                 _ = interval.tick() => self.report_statistics().await,
                 else => break,
             }
         }
     }
 
-    fn process_event(&mut self, event: SequenceBufferEvent) {
-        match event {
-            SequenceBufferEvent::PacketDrop => self.dropped_packets += 1,
-            SequenceBufferEvent::OutOfOrderPacket => self.out_of_order_packets += 1,
-        }
-    }
-
     async fn process_packet(&mut self, len: usize, addr: SocketAddr) {
         self.update_buffer_usage();
         if addr.ip() == self.desc.origin_ip {
-            let packets = self.sequence_buffer.update(&self.rtp_buffer[0..len]);
-            for packet in packets.iter_mut() {
-                let mut timestamp = packet.timestamp;
-                for (i, raw_sample) in packet
-                    .payload
+            if let Ok(rtp) = RtpReader::new(&self.rtp_buffer[0..len]) {
+                let mut timestamp = MediaClockTimestamp::new(rtp.timestamp(), &self.desc);
+                for (i, raw_sample) in rtp
+                    .payload()
                     .chunks(self.desc.bytes_per_sample())
                     .enumerate()
                 {
@@ -907,7 +893,6 @@ where
                     }
                 }
             }
-            packets.clear();
         } else {
             log::warn!("Received packet from wrong sender: {addr}");
         }
