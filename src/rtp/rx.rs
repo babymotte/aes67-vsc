@@ -191,7 +191,16 @@ impl RxDescriptor {
     }
 
     pub fn frames_per_link_offset_buffer(&self) -> usize {
-        utils::frames_per_link_offset_buffer(self.link_offset, self.packet_time, self.sampling_rate)
+        utils::frames_per_link_offset_buffer(self.link_offset, self.sampling_rate)
+    }
+
+    pub fn link_offset_buffer_size(&self) -> usize {
+        utils::link_offset_buffer_size(
+            self.channels,
+            self.link_offset,
+            self.sampling_rate,
+            self.bit_depth,
+        )
     }
 
     pub fn rtp_payload_size(&self) -> usize {
@@ -213,12 +222,7 @@ impl RxDescriptor {
     }
 
     pub fn samples_per_link_offset_buffer(&self) -> usize {
-        utils::samples_per_link_offset_buffer(
-            self.channels,
-            self.link_offset,
-            self.packet_time,
-            self.sampling_rate,
-        )
+        utils::samples_per_link_offset_buffer(self.channels, self.link_offset, self.sampling_rate)
     }
 
     pub fn rtp_buffer_size(&self) -> usize {
@@ -279,9 +283,11 @@ impl RtpRxApi {
             recv_init_tx,
             output_event_tx,
             msg_rx,
+            link_offset,
         )
         .expect("audio system failed");
 
+        let sample_rate = audio_system.sample_rate();
         let sample_reader = read_f32_sample;
 
         subsys.start(SubsystemBuilder::new("rtp/rx", move |s| async move {
@@ -298,6 +304,7 @@ impl RtpRxApi {
                 local_ip,
                 msg_tx,
                 output_event_rx,
+                sample_rate,
             );
             actor.log_channel_consumption().await?;
             let res = actor.run("rtp-rx".to_owned(), cancel).await;
@@ -362,6 +369,7 @@ where
     active_ports: Box<[Option<RxDescriptor>]>,
     msg_tx: mpsc::Sender<Message>,
     output_event_rx: mpsc::Receiver<OutputEvent>,
+    sample_rate: usize,
 }
 
 impl<AS, S> Drop for RtpRxActor<AS, S>
@@ -405,7 +413,7 @@ where
                 },
                 Some((buffer_size,tx)) = self.recv_init_rx.recv() => {
                     log::info!("Initializing receiver channel buffer …");
-                    tx.send(self.initialize_receiver_buffer(self.max_channels, buffer_size).await?).ok();
+                    tx.send(self.initialize_receiver_buffer(self.max_channels, buffer_size, self.sample_rate).await?).ok();
                 },
                 Some(output_event) = self.output_event_rx.recv() => self.process_output_event(output_event).await,
                 else => break,
@@ -433,6 +441,7 @@ where
         local_ip: Option<IpAddr>,
         msg_tx: mpsc::Sender<Message>,
         output_event_rx: mpsc::Receiver<OutputEvent>,
+        sample_rate: usize,
     ) -> Self {
         let receiver_ids = HashMap::new();
         let active_receivers = init_buffer(max_channels, |_| None);
@@ -458,6 +467,7 @@ where
             active_ports,
             msg_tx,
             output_event_rx,
+            sample_rate,
         }
     }
 
@@ -485,6 +495,7 @@ where
         &mut self,
         channels: usize,
         buffer_size: usize,
+        sample_rate: usize,
     ) -> RxResult<Box<[mpsc::Receiver<RtpSample<S>>]>> {
         let mut senders = vec![];
         let mut receivers = vec![];
@@ -492,7 +503,8 @@ where
         for _ in 0..channels {
             // TODO get and use audio system sample rate
             let channel_buffer_size =
-                utils::frames_per_link_offset_buffer(self.link_offset, 1.0, 48000).max(buffer_size);
+                utils::frames_per_link_offset_buffer(self.link_offset, sample_rate)
+                    .max(buffer_size);
             let (tx, rx) = mpsc::channel(channel_buffer_size);
             senders.push(Some(tx));
             receivers.push(rx);
@@ -829,7 +841,7 @@ struct ReceiveLoop<S: Copy> {
     sample_reader: fn(&[u8]) -> S,
 }
 
-impl<S> ReceiveLoop<S>
+impl<S: Default> ReceiveLoop<S>
 where
     S: Copy,
 {
@@ -875,7 +887,11 @@ where
         self.update_buffer_usage();
         if addr.ip() == self.desc.origin_ip {
             if let Ok(rtp) = RtpReader::new(&self.rtp_buffer[0..len]) {
-                let mut timestamp = MediaClockTimestamp::new(rtp.timestamp(), &self.desc);
+                let mut timestamp = MediaClockTimestamp::new(
+                    rtp.timestamp(),
+                    self.desc.sampling_rate,
+                    self.desc.link_offset,
+                );
                 for (i, raw_sample) in rtp
                     .payload()
                     .chunks(self.desc.bytes_per_sample())

@@ -22,7 +22,9 @@ use super::{
 use crate::{
     error::RtpResult,
     rtp::RxDescriptor,
-    utils::{init_buffer, set_realtime_priority, MediaClockTimestamp},
+    utils::{
+        frames_per_link_offset_buffer, init_buffer, set_realtime_priority, MediaClockTimestamp,
+    },
 };
 use jack::{
     contrib::ClosureProcessHandler, AudioIn, AudioOut, Client, ClientOptions, Control, Frames,
@@ -39,6 +41,7 @@ const CLIENT_NAME: &str = "AES67 VirtualSoundCard";
 
 pub(crate) struct JackAudioSystem {
     cancel: Option<oneshot::Sender<()>>,
+    sample_rate: usize,
 }
 
 struct State {
@@ -52,8 +55,10 @@ struct State {
     msg_rx: mpsc::Receiver<Message>,
     active_inputs: Box<[bool]>,
     active_outputs: Box<[Option<RxDescriptor>]>,
+    // TODO make this a queue instead of just a single sample
     pending_samples: Box<[Option<RtpSample<f32>>]>,
-    media_clocks: Box<[Option<MediaClockTimestamp>]>,
+    link_offset: f32,
+    jack_media_clock: Option<MediaClockTimestamp>,
 }
 
 impl JackAudioSystem {
@@ -65,12 +70,19 @@ impl JackAudioSystem {
         receiver_init: ReceiverBufferInitCallback<f32>,
         status: mpsc::Sender<OutputEvent>,
         msg_rx: mpsc::Receiver<Message>,
+        link_offset: f32,
     ) -> RtpResult<Self> {
         let active_inputs = init_buffer(transmitters, |_| false);
         let active_outputs = init_buffer(receivers, |_| None);
 
         // TODO evaluate client status
         let (client, _status) = Client::new(CLIENT_NAME, ClientOptions::default())?;
+        let sample_rate = client.sample_rate();
+        let buffer_size = frames_per_link_offset_buffer(link_offset, sample_rate) as Frames / 2;
+        // TODO don't set buffer size automatically, make that option available in the UI
+        if let Err(e) = client.set_buffer_size(buffer_size) {
+            log::error!("Could not set JACK buffer size: {e}");
+        }
 
         // transmitters are mapped to JACK inputs
         let mut _in_ports = vec![];
@@ -85,9 +97,9 @@ impl JackAudioSystem {
         }
 
         let pending_samples = init_buffer(receivers, |_| None);
-        let timestamps = init_buffer(receivers, |_| None);
         let _transmitters = None;
         let receivers = None;
+        let jack_media_clock = None;
 
         let process = ClosureProcessHandler::with_state(
             State {
@@ -102,13 +114,12 @@ impl JackAudioSystem {
                 active_outputs,
                 msg_rx,
                 pending_samples,
-                media_clocks: timestamps,
+                link_offset,
+                jack_media_clock,
             },
             process,
             init_buffers,
         );
-
-        // 4. Activate the client
 
         let (st, op) = oneshot::channel();
         thread::spawn(|| {
@@ -126,7 +137,10 @@ impl JackAudioSystem {
             }
         });
 
-        Ok(Self { cancel: Some(st) })
+        Ok(Self {
+            cancel: Some(st),
+            sample_rate,
+        })
     }
 }
 
@@ -138,6 +152,10 @@ impl AudioSystem for JackAudioSystem {
         if let Some(c) = self.cancel.take() {
             c.send(()).ok();
         }
+    }
+
+    fn sample_rate(&self) -> usize {
+        self.sample_rate
     }
 }
 
@@ -174,7 +192,41 @@ fn init_buffers(state: &mut State, _: &Client, len: Frames) -> Control {
     Control::Continue
 }
 
-fn process(state: &mut State, _client: &Client, ps: &ProcessScope) -> Control {
+fn process(state: &mut State, client: &Client, ps: &ProcessScope) -> Control {
+    let media_clock = MediaClockTimestamp::now(client.sample_rate(), state.link_offset, 0);
+    let mut jack_media_clock = if let Some(it) = state.jack_media_clock {
+        it
+    } else {
+        media_clock
+    };
+    let drift = jack_media_clock - media_clock;
+    // dbg!(drift);
+
+    // TODO find out cause of jumps on port connect
+    // TODO is JACK clock monotonic?
+
+    // severely out of sync, this will cause an audible jump
+    if drift.abs() >= 10 * client.buffer_size() as i64 {
+        log::warn!("JACK media clock is {drift} samples off, resetting it to system media clock");
+        jack_media_clock = media_clock;
+    } else
+    // if jack clock is slightly off, bring them back together again
+    if drift < 0 {
+        // JACK media clock is BEHIND
+        log::warn!("JACK media clock is {} samples late", drift.abs());
+        jack_media_clock = jack_media_clock.next();
+    } else
+    // we tolerate a certain amount of being early since inserting samples
+    // with the current implementation is more disruptive than dropping some
+    // TODO make inserting samples more subtle and do it always
+    if drift > client.buffer_size() as i64 {
+        // JACK media clock is AHEAD
+        log::warn!("JACK media clock is {} samples early", drift);
+        jack_media_clock = jack_media_clock.previous();
+    }
+
+    state.jack_media_clock = Some(jack_media_clock + client.buffer_size());
+
     if let Ok(msg) = state.msg_rx.try_recv() {
         match msg {
             Message::ActiveInputsChanged(it) => state.active_inputs = it,
@@ -192,14 +244,7 @@ fn process(state: &mut State, _client: &Client, ps: &ProcessScope) -> Control {
 
                 let mut index = 0;
 
-                // TODO move media clock and buffer mapping out of audio system into RTP receiver
-
-                let mut media_clock = if let Some(it) = state.media_clocks[port_nr].take() {
-                    it
-                } else {
-                    // media clock has not been initialized, create a new one based on system time
-                    MediaClockTimestamp::now(&desc)
-                };
+                let mut port_jack_media_clock = jack_media_clock + desc.rtp_offset;
 
                 while index < buffer.len() {
                     let next = if let Some(it) = state.pending_samples[port_nr].take() {
@@ -211,35 +256,35 @@ fn process(state: &mut State, _client: &Client, ps: &ProcessScope) -> Control {
                     match next {
                         Ok(RtpSample(playout_time, value)) => {
                             // TODO check if all expected samples have arrived and report lost packet if not
-                            if playout_time < media_clock {
-                                let diff = playout_time - media_clock;
+                            if playout_time < port_jack_media_clock {
+                                let diff = playout_time - port_jack_media_clock;
                                 let destination = index as i64 + diff;
                                 if destination > 0 {
                                     // sample belongs in this buffer, we just need to jump back a bit
                                     // TODO reduce log level
                                     log::warn!(
-                                        "sample is {} frames late ({playout_time} < {media_clock}) - backtracking {diff} samples", -diff
+                                        "sample is {} frames late ({playout_time} < {port_jack_media_clock}) - backtracking {diff} samples", -diff
                                     );
                                     // reset index to playout time
                                     index = destination as usize;
                                     // reset media clock to playout time
-                                    media_clock = playout_time;
+                                    port_jack_media_clock = playout_time;
                                 } else {
                                     // sample belonged to previous buffer, nothing we can do here
                                     // TODO report dropped packet
                                     log::warn!(
-                                        "sample is {} frames late ({playout_time} < {media_clock}) - dropping it", -diff
+                                        "sample is {} frames late ({playout_time} < {port_jack_media_clock}) - dropping it", -diff
                                     );
                                     continue;
                                 }
-                            } else if playout_time > media_clock {
-                                let diff = (playout_time - media_clock) as usize;
+                            } else if playout_time > port_jack_media_clock {
+                                let diff = (playout_time - port_jack_media_clock) as usize;
                                 let destination = index + diff;
                                 if destination < buffer.len() {
                                     // sample belongs in this buffer, we just need to jump ahead a bit
                                     // TODO reduce log level
                                     log::warn!(
-                                        "sample is {diff} frames early ({playout_time} > {media_clock}) - skipping {diff} samples"
+                                        "sample is {diff} frames early ({playout_time} > {port_jack_media_clock}) - skipping {diff} samples"
                                     );
                                     // fill buffer up to playout time with silence in case we don't backtrack
                                     for i in index..destination {
@@ -248,12 +293,12 @@ fn process(state: &mut State, _client: &Client, ps: &ProcessScope) -> Control {
                                     // advance index to playout time
                                     index = destination;
                                     // advance media clock to playout time
-                                    media_clock = playout_time;
+                                    port_jack_media_clock = playout_time;
                                 } else {
                                     // sample belongs in the next buffer, we play out silence for now and try again later
                                     // TODO report buffer underrun
                                     log::warn!(
-                                        "sample is {diff} frames early ({playout_time} > {media_clock}) - waiting for next buffer"
+                                        "sample is {diff} frames early ({playout_time} > {port_jack_media_clock}) - waiting for next buffer"
                                     );
                                     state.pending_samples[port_nr] =
                                         Some(RtpSample(playout_time, value));
@@ -264,9 +309,8 @@ fn process(state: &mut State, _client: &Client, ps: &ProcessScope) -> Control {
 
                             buffer[index] = value;
                             last = value;
+                            port_jack_media_clock = port_jack_media_clock.next();
                             index += 1;
-                            media_clock = media_clock.next();
-                            state.media_clocks[port_nr] = Some(media_clock);
                             if index == buffer.len() {
                                 break;
                             }
@@ -301,6 +345,37 @@ fn process(state: &mut State, _client: &Client, ps: &ProcessScope) -> Control {
 
     Control::Continue
 }
+
+// fn compensate_clock_drift(
+//     state: &mut State,
+//     client: &Client,
+//     ps: &ProcessScope,
+// ) -> MediaClockTimestamp {
+//     let media_clock = MediaClockTimestamp::now(client.sample_rate(), state.link_offset);
+//     let jack_clock = ps.last_frame_time() as u64;
+//     let current_jack_clock_offset = jack_clock as i64 - media_clock.timestamp as i64;
+
+//     if state.jack_clock_offset != 0 {
+//         let drift = state.jack_clock_offset - current_jack_clock_offset;
+//         dbg!(drift);
+//         // let new_jack_clock_offset = if state.jack_clock_offset == 0 {
+//         //     current_jack_clock_offset
+//         // } else {
+//         //     (state.jack_clock_offset * 99 + current_jack_clock_offset) / 100
+//         // };
+//         // let drift = new_jack_clock_offset - state.jack_clock_offset;
+//         // if drift != 0 {
+//         //     log::warn!("JACK clock drift: {drift}");
+//         //     // TODO adjust media clock
+//         // }
+//         state.accumulated_jack_clock_offset += drift;
+//         dbg!(state.accumulated_jack_clock_offset);
+//         // media_clock.jump_to((jack_clock as i64 - new_jack_clock_offset) as u32)
+//     }
+
+//     state.jack_clock_offset = current_jack_clock_offset;
+//     media_clock
+// }
 
 fn connect_ports(client: &Client) {
     // TODO set up routing according to persisted config

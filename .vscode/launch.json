@@ -1,0 +1,50 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug unit tests in library 'aes67_vsc'",
+      "cargo": {
+        "args": ["test", "--no-run", "--lib", "--package=aes67-vsc"],
+        "filter": {
+          "name": "aes67_vsc",
+          "kind": "lib"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug executable 'aes67-vsc'",
+      "cargo": {
+        "args": ["build", "--bin=aes67-vsc", "--package=aes67-vsc"],
+        "filter": {
+          "name": "aes67-vsc",
+          "kind": "bin"
+        }
+      },
+      "args": ["-i8", "-l4", "192.168.178.62"],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug unit tests in executable 'aes67-vsc'",
+      "cargo": {
+        "args": ["test", "--no-run", "--bin=aes67-vsc", "--package=aes67-vsc"],
+        "filter": {
+          "name": "aes67-vsc",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}

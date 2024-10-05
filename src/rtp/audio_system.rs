@@ -32,6 +32,8 @@ pub(crate) trait AudioSystem {
     type SampleFormat;
 
     fn close(&mut self);
+
+    fn sample_rate(&self) -> usize;
 }
 
 pub(crate) type TransmitterBufferInitCallback<S> =

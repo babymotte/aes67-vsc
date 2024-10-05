@@ -16,7 +16,6 @@
  */
 
 use super::frames_per_link_offset_buffer;
-use crate::rtp::RxDescriptor;
 use libc::{clock_gettime, timespec, CLOCK_REALTIME};
 use std::{
     cmp::Ordering,
@@ -28,11 +27,9 @@ use std::{
 
 #[derive(Debug, Clone, Copy)]
 pub struct MediaClockTimestamp {
-    timestamp: u32,
-    sample_rate: u32,
-    packet_time: f32,
+    pub timestamp: u32,
+    sample_rate: usize,
     link_offset: f32,
-    rtp_offset: u32,
 }
 
 impl Display for MediaClockTimestamp {
@@ -42,44 +39,27 @@ impl Display for MediaClockTimestamp {
 }
 
 impl MediaClockTimestamp {
-    pub fn now(desc: &RxDescriptor) -> Self {
+    pub fn now(sample_rate: usize, link_offset: f32, rtp_offset: u32) -> Self {
         Self {
-            timestamp: wrapped_media_time(desc.sampling_rate as usize, desc.rtp_offset),
-            sample_rate: desc.sampling_rate as u32,
-            packet_time: desc.packet_time,
-            link_offset: desc.link_offset,
-            rtp_offset: desc.rtp_offset,
+            timestamp: wrapped_media_time(sample_rate, rtp_offset),
+            sample_rate,
+            link_offset,
         }
     }
 
-    pub fn new(timestamp: u32, desc: &RxDescriptor) -> Self {
+    pub fn new(timestamp: u32, sample_rate: usize, link_offset: f32) -> Self {
         Self {
             timestamp,
-            sample_rate: desc.sampling_rate as u32,
-            packet_time: desc.packet_time,
-            link_offset: desc.link_offset,
-            rtp_offset: desc.rtp_offset,
+            sample_rate,
+            link_offset,
         }
     }
-
-    // pub fn proceed(&self, frames: u64) -> Self {
-    //     let timestamp = wrap_u64(self.timestamp as u64 + frames);
-    //     Self {
-    //         timestamp,
-    //         sample_rate: self.sample_rate,
-    //         packet_time: self.packet_time,
-    //         link_offset: self.link_offset,
-    //         rtp_offset: self.rtp_offset,
-    //     }
-    // }
 
     pub fn jump_to(&self, timestamp: u32) -> Self {
         Self {
             timestamp,
             sample_rate: self.sample_rate,
-            packet_time: self.packet_time,
             link_offset: self.link_offset,
-            rtp_offset: self.rtp_offset,
         }
     }
 
@@ -89,20 +69,24 @@ impl MediaClockTimestamp {
         Self {
             timestamp,
             sample_rate: self.sample_rate,
-            packet_time: self.packet_time,
             link_offset: self.link_offset,
-            rtp_offset: self.rtp_offset,
+        }
+    }
+
+    pub fn previous(&self) -> Self {
+        let timestamp = self.timestamp.wrapping_sub(1);
+
+        Self {
+            timestamp,
+            sample_rate: self.sample_rate,
+            link_offset: self.link_offset,
         }
     }
 
     pub fn playout_time(&self) -> MediaClockTimestamp {
         let timestamp = wrap_u64(
             self.timestamp as u64
-                + frames_per_link_offset_buffer(
-                    self.link_offset,
-                    self.packet_time,
-                    self.sample_rate as usize,
-                ) as u64,
+                + frames_per_link_offset_buffer(self.link_offset, self.sample_rate as usize) as u64,
         );
         self.jump_to(timestamp)
     }
@@ -135,9 +119,7 @@ impl Add<u32> for MediaClockTimestamp {
         Self {
             sample_rate: self.sample_rate,
             timestamp: self.timestamp.wrapping_add(rhs),
-            packet_time: self.packet_time,
             link_offset: self.link_offset,
-            rtp_offset: self.rtp_offset,
         }
     }
 }
@@ -149,9 +131,7 @@ impl Add<u64> for MediaClockTimestamp {
         Self {
             sample_rate: self.sample_rate,
             timestamp: self.timestamp.wrapping_add((rhs % u32::MAX as u64) as u32),
-            packet_time: self.packet_time,
             link_offset: self.link_offset,
-            rtp_offset: self.rtp_offset,
         }
     }
 }
@@ -290,38 +270,30 @@ mod test {
     #[test]
     fn media_clock_timestamp_addition_works() {
         let ts_1 = MediaClockTimestamp {
-            packet_time: 1.0,
             sample_rate: 48000,
             timestamp: 0,
             link_offset: 1.0,
-            rtp_offset: 0,
         };
         assert_eq!(
             ts_1 + 1u32,
             MediaClockTimestamp {
-                packet_time: 1.0,
                 sample_rate: 48000,
                 timestamp: 1,
                 link_offset: 1.0,
-                rtp_offset: 0,
             }
         );
 
         let ts_1 = MediaClockTimestamp {
-            packet_time: 1.0,
             sample_rate: 48000,
             timestamp: u32::MAX,
             link_offset: 1.0,
-            rtp_offset: 0,
         };
         assert_eq!(
             ts_1 + 1u32,
             MediaClockTimestamp {
-                packet_time: 1.0,
                 sample_rate: 48000,
                 timestamp: 0,
                 link_offset: 1.0,
-                rtp_offset: 0,
             }
         );
     }
@@ -329,44 +301,34 @@ mod test {
     #[test]
     fn media_clock_timestamp_subtraction_works() {
         let ts_1 = MediaClockTimestamp {
-            packet_time: 1.0,
             sample_rate: 48000,
             timestamp: 0,
             link_offset: 1.0,
-            rtp_offset: 0,
         };
         let ts_2 = MediaClockTimestamp {
-            packet_time: 1.0,
             sample_rate: 48000,
             timestamp: 1,
             link_offset: 1.0,
-            rtp_offset: 0,
         };
         assert_eq!(ts_2 - ts_1, 1);
 
         let ts_1 = MediaClockTimestamp {
-            packet_time: 1.0,
             sample_rate: 48000,
             timestamp: 0,
             link_offset: 1.0,
-            rtp_offset: 0,
         };
         let ts_2 = next_packet(&ts_1);
         assert_eq!(ts_2 - ts_1, frames_per_packet(48000, 1.0) as i64);
 
         let ts_1 = MediaClockTimestamp {
-            packet_time: 1.0,
             sample_rate: 48000,
             timestamp: u32::MAX,
             link_offset: 1.0,
-            rtp_offset: 0,
         };
         let ts_2 = MediaClockTimestamp {
-            packet_time: 1.0,
             sample_rate: 48000,
             timestamp: 0,
             link_offset: 1.0,
-            rtp_offset: 0,
         };
         assert_eq!(ts_2 - ts_1, 1);
         assert_eq!(ts_1 - ts_2, -1);
@@ -375,20 +337,16 @@ mod test {
     #[test]
     fn media_clock_timestamp_next_works() {
         let ts_1 = MediaClockTimestamp {
-            packet_time: 1.0,
             sample_rate: 48000,
             timestamp: 1,
             link_offset: 1.0,
-            rtp_offset: 0,
         };
         assert_eq!(next_packet(&ts_1).timestamp, 49);
 
         let ts_1 = MediaClockTimestamp {
-            packet_time: 1.0,
             sample_rate: 48000,
             timestamp: u32::MAX - 20,
             link_offset: 1.0,
-            rtp_offset: 0,
         };
         assert_eq!(next_packet(&ts_1).timestamp, 27);
     }
@@ -396,11 +354,9 @@ mod test {
     #[test]
     fn media_clock_timestamp_compare_works_without_wraparound() {
         let ts_1 = MediaClockTimestamp {
-            packet_time: 1.0,
             sample_rate: 48000,
             timestamp: 1,
             link_offset: 1.0,
-            rtp_offset: 0,
         };
         let ts_2 = next_packet(&ts_1);
         assert!(ts_1 < ts_2);
@@ -409,18 +365,14 @@ mod test {
     #[test]
     fn media_clock_timestamp_compare_works_with_wraparound_of_one() {
         let ts_1 = MediaClockTimestamp {
-            packet_time: 1.0,
             sample_rate: 48000,
             timestamp: u32::MAX,
             link_offset: 1.0,
-            rtp_offset: 0,
         };
         let ts_2 = MediaClockTimestamp {
-            packet_time: 1.0,
             sample_rate: 48000,
             timestamp: 0,
             link_offset: 1.0,
-            rtp_offset: 0,
         };
         assert!(ts_1 < ts_2);
     }
@@ -428,53 +380,27 @@ mod test {
     #[test]
     fn media_clock_timestamp_compare_works_with_wraparound_of_multiple() {
         let ts_1 = MediaClockTimestamp {
-            packet_time: 1.0,
             sample_rate: 48000,
             timestamp: u32::MAX - 4,
             link_offset: 1.0,
-            rtp_offset: 0,
         };
         let ts_2 = next_packet(&ts_1);
         assert!(ts_1 < ts_2);
         let ts_1 = MediaClockTimestamp {
-            packet_time: 1.0,
             sample_rate: 48000,
             timestamp: u32::MAX - 4,
             link_offset: 4.0,
-            rtp_offset: 0,
         };
         let ts_2 = next_packet(&ts_1);
         assert!(ts_1 < ts_2);
     }
 
-    // #[test]
-    // fn media_clock_timestamp_compare_with_wraparound_is_limited_to_link_offset() {
-    //     let ts_1 = MediaClockTimestamp {
-    //         packet_time: 1.0,
-    //         sample_rate: 48000,
-    //         timestamp: u32::MAX - 4,
-    //         link_offset: 4.0,
-    //         rtp_offset: 0,
-    //     };
-    //     let mut ts_next = ts_1;
-    //     for i in 0..2 * ts_1.link_offset as usize {
-    //         if i <= ts_1.link_offset as usize {
-    //             assert!(ts_1 <= ts_next);
-    //         } else {
-    //             assert!(ts_1 > ts_next);
-    //         }
-    //         ts_next = ts_next.next_packet();
-    //     }
-    // }
-
     #[test]
     fn media_clock_timestamp_sorting_without_wraparound_works() {
         let ts_1 = MediaClockTimestamp {
-            packet_time: 1.0,
             sample_rate: 48000,
             timestamp: 0,
             link_offset: 4.0,
-            rtp_offset: 0,
         };
         let ts_2 = next_packet(&ts_1);
         let ts_3 = next_packet(&ts_2);
@@ -488,11 +414,9 @@ mod test {
     #[test]
     fn media_clock_timestamp_sorting_with_wraparound_works() {
         let ts_1 = MediaClockTimestamp {
-            packet_time: 1.0,
             sample_rate: 48000,
             timestamp: u32::MAX - ((1.5 * frames_per_packet(48000, 1.0) as f32) as u32),
             link_offset: 4.0,
-            rtp_offset: 0,
         };
         let ts_2 = next_packet(&ts_1);
         let ts_3 = next_packet(&ts_2);
@@ -507,11 +431,9 @@ mod test {
     #[test]
     fn media_clock_timestamp_playout_time_is_consistent() {
         let mut ts = MediaClockTimestamp {
-            packet_time: 1.0,
             sample_rate: 48000,
             timestamp: 0,
             link_offset: 4.0,
-            rtp_offset: 0,
         };
 
         let mut last_playout_time = None;
@@ -531,7 +453,7 @@ mod test {
     }
 
     fn next_packet(ts: &MediaClockTimestamp) -> MediaClockTimestamp {
-        let increment = frames_per_packet(ts.sample_rate as usize, ts.packet_time) as u32;
+        let increment = frames_per_packet(ts.sample_rate as usize, 1.0) as u32;
         *ts + increment
     }
 }

@@ -21,7 +21,7 @@ mod time;
 pub(crate) use buffers::*;
 pub(crate) use time::*;
 
-use std::net::IpAddr;
+use std::{net::IpAddr, time::Duration};
 use thread_priority::{
     set_thread_priority_and_policy, thread_native_id, RealtimeThreadSchedulePolicy, ThreadPriority,
     ThreadSchedulePolicy,
@@ -64,12 +64,19 @@ pub fn packets_in_link_offset(link_offset: f32, packet_time: f32) -> usize {
     f32::ceil(link_offset / packet_time) as usize
 }
 
-pub fn frames_per_link_offset_buffer(
+pub fn frames_per_link_offset_buffer(link_offset: f32, sampling_rate: usize) -> usize {
+    f32::ceil((sampling_rate as f32 * link_offset) / Duration::from_secs(1).as_millis() as f32)
+        as usize
+}
+
+pub fn link_offset_buffer_size(
+    channels: usize,
     link_offset: f32,
-    packet_time: f32,
     sampling_rate: usize,
+    bit_depth: usize,
 ) -> usize {
-    packets_in_link_offset(link_offset, packet_time) * frames_per_packet(sampling_rate, packet_time)
+    samples_per_link_offset_buffer(channels, link_offset, sampling_rate)
+        * bytes_per_sample(bit_depth)
 }
 
 pub fn rtp_payload_size(
@@ -93,10 +100,9 @@ pub fn rtp_packet_size(
 pub fn samples_per_link_offset_buffer(
     channels: usize,
     link_offset: f32,
-    packet_time: f32,
     sampling_rate: usize,
 ) -> usize {
-    channels * frames_per_link_offset_buffer(link_offset, packet_time, sampling_rate)
+    channels * frames_per_link_offset_buffer(link_offset, sampling_rate)
 }
 
 pub fn rtp_buffer_size(
@@ -143,6 +149,6 @@ mod test {
 
     #[test]
     fn frames_per_link_offset_buffer_works() {
-        assert_eq!(192, frames_per_link_offset_buffer(4.0, 1.0, 48_000));
+        assert_eq!(192, frames_per_link_offset_buffer(4.0, 48_000));
     }
 }
