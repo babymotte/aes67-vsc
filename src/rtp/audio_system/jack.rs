@@ -200,7 +200,6 @@ fn process(state: &mut State, client: &Client, ps: &ProcessScope) -> Control {
         media_clock
     };
     let drift = jack_media_clock - media_clock;
-    // dbg!(drift);
 
     // TODO find out cause of jumps on port connect
     // TODO is JACK clock monotonic?
@@ -213,11 +212,11 @@ fn process(state: &mut State, client: &Client, ps: &ProcessScope) -> Control {
     // if jack clock is slightly off, bring them back together again
     if drift < 0 {
         // JACK media clock is BEHIND
-        log::warn!("JACK media clock is {} samples late", drift.abs());
+        log::debug!("JACK media clock is {} samples late", drift.abs());
         jack_media_clock = jack_media_clock.next();
     } else if drift > 0 {
         // JACK media clock is AHEAD
-        log::warn!("JACK media clock is {} samples early", drift);
+        log::debug!("JACK media clock is {} samples early", drift);
         jack_media_clock = jack_media_clock.previous();
     }
 
@@ -243,7 +242,7 @@ fn process(state: &mut State, client: &Client, ps: &ProcessScope) -> Control {
                     buffer[i] = value;
                 } else {
                     // TODO report buffer underrund
-                    log::warn!(
+                    log::debug!(
                         "buffer underrun in receiver {} channel {} at timestamp {}",
                         playout_buffer.desc.id,
                         channel,
