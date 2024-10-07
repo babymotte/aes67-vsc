@@ -21,18 +21,18 @@ use super::{
 };
 use crate::{
     error::RtpResult,
-    rtp::RxDescriptor,
     utils::{
-        frames_per_link_offset_buffer, init_buffer, set_realtime_priority, MediaClockTimestamp,
+        frames_per_link_offset_buffer, init_buffer, read_f32_sample, set_realtime_priority,
+        MediaClockTimestamp, PlayoutBufferReader, PlayoutBufferWriter,
     },
 };
 use jack::{
     contrib::ClosureProcessHandler, AudioIn, AudioOut, Client, ClientOptions, Control, Frames,
     Port, ProcessScope,
 };
-use std::thread;
+use std::{borrow::BorrowMut, thread};
 use tokio::sync::{
-    mpsc::{self, error::TryRecvError},
+    mpsc::{self},
     oneshot,
 };
 use tokio_graceful_shutdown::SubsystemHandle;
@@ -53,8 +53,8 @@ struct State {
     receiver_init: ReceiverBufferInitCallback<f32>,
     status: mpsc::Sender<OutputEvent>,
     msg_rx: mpsc::Receiver<Message>,
-    active_inputs: Box<[bool]>,
-    active_outputs: Box<[Option<RxDescriptor>]>,
+    active_inputs: Box<[Option<(usize, PlayoutBufferWriter)>]>,
+    active_outputs: Box<[Option<(usize, PlayoutBufferReader)>]>,
     // TODO make this a queue instead of just a single sample
     pending_samples: Box<[Option<RtpSample<f32>>]>,
     link_offset: f32,
@@ -72,7 +72,7 @@ impl JackAudioSystem {
         msg_rx: mpsc::Receiver<Message>,
         link_offset: f32,
     ) -> RtpResult<Self> {
-        let active_inputs = init_buffer(transmitters, |_| false);
+        let active_inputs = init_buffer(transmitters, |_| None);
         let active_outputs = init_buffer(receivers, |_| None);
 
         // TODO evaluate client status
@@ -234,110 +234,29 @@ fn process(state: &mut State, client: &Client, ps: &ProcessScope) -> Control {
         }
     }
 
-    if let Some(receivers) = state.receivers.as_mut() {
-        for (port_nr, port) in state.out_ports.iter_mut().enumerate() {
-            let buffer = port.as_mut_slice(ps);
+    for (port_nr, port) in state.out_ports.iter_mut().enumerate() {
+        let buffer = port.as_mut_slice(ps);
 
-            if let Some(desc) = &state.active_outputs[port_nr] {
-                let recv = &mut receivers[port_nr];
-                let mut last = 0.0;
+        if let Some((channel, ref mut playout_buffer)) = &mut state.active_outputs[port_nr] {
+            let port_jack_media_clock = jack_media_clock + playout_buffer.desc.rtp_offset;
 
-                let mut index = 0;
-
-                let mut port_jack_media_clock = jack_media_clock + desc.rtp_offset;
-
-                while index < buffer.len() {
-                    let next = if let Some(it) = state.pending_samples[port_nr].take() {
-                        Ok(it)
-                    } else {
-                        recv.try_recv()
-                    };
-
-                    match next {
-                        Ok(RtpSample(playout_time, value)) => {
-                            // TODO check if all expected samples have arrived and report lost packet if not
-                            if playout_time < port_jack_media_clock {
-                                let diff = playout_time - port_jack_media_clock;
-                                let destination = index as i64 + diff;
-                                if destination > 0 {
-                                    // sample belongs in this buffer, we just need to jump back a bit
-                                    // TODO reduce log level
-                                    log::warn!(
-                                        "sample is {} frames late ({playout_time} < {port_jack_media_clock}) - backtracking {diff} samples", -diff
-                                    );
-                                    // reset index to playout time
-                                    index = destination as usize;
-                                    // reset media clock to playout time
-                                    port_jack_media_clock = playout_time;
-                                } else {
-                                    // sample belonged to previous buffer, nothing we can do here
-                                    // TODO report dropped packet
-                                    log::warn!(
-                                        "sample is {} frames late ({playout_time} < {port_jack_media_clock}) - dropping it", -diff
-                                    );
-                                    continue;
-                                }
-                            } else if playout_time > port_jack_media_clock {
-                                let diff = (playout_time - port_jack_media_clock) as usize;
-                                let destination = index + diff;
-                                if destination < buffer.len() {
-                                    // sample belongs in this buffer, we just need to jump ahead a bit
-                                    // TODO reduce log level
-                                    log::warn!(
-                                        "sample is {diff} frames early ({playout_time} > {port_jack_media_clock}) - skipping {diff} samples"
-                                    );
-                                    // fill buffer up to playout time with silence in case we don't backtrack
-                                    for i in index..destination {
-                                        buffer[i] = last;
-                                    }
-                                    // advance index to playout time
-                                    index = destination;
-                                    // advance media clock to playout time
-                                    port_jack_media_clock = playout_time;
-                                } else {
-                                    // sample belongs in the next buffer, we play out silence for now and try again later
-                                    // TODO report buffer underrun
-                                    log::warn!(
-                                        "sample is {diff} frames early ({playout_time} > {port_jack_media_clock}) - waiting for next buffer"
-                                    );
-                                    state.pending_samples[port_nr] =
-                                        Some(RtpSample(playout_time, value));
-                                    silence(buffer, last, index);
-                                    break;
-                                }
-                            }
-
-                            buffer[index] = value;
-                            last = value;
-                            port_jack_media_clock = port_jack_media_clock.next();
-                            index += 1;
-                            if index == buffer.len() {
-                                break;
-                            }
-                        }
-                        Err(e) => match e {
-                            TryRecvError::Empty => {
-                                state
-                                    .status
-                                    .try_send(OutputEvent::BufferUnderrun(port_nr))
-                                    .ok();
-                                silence(buffer, last, index);
-                                break;
-                            }
-                            TryRecvError::Disconnected => {
-                                silence(buffer, last, index);
-                                break;
-                            }
-                        },
-                    };
+            for i in 0..buffer.len() {
+                if let Some(value) =
+                    playout_buffer.read(port_jack_media_clock + i as u32, *channel, read_f32_sample)
+                {
+                    buffer[i] = value;
+                } else {
+                    // TODO report buffer underrund
+                    log::warn!(
+                        "buffer underrun in receiver {} channel {} at timestamp {}",
+                        playout_buffer.desc.id,
+                        channel,
+                        port_jack_media_clock
+                    );
                 }
-            } else {
-                silence(buffer, 0.0, 0);
             }
-        }
-    } else {
-        for port in &mut state.out_ports {
-            silence(port.as_mut_slice(ps), 0.0, 0);
+        } else {
+            silence(buffer, 0.0, 0);
         }
     }
 

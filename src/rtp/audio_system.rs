@@ -19,11 +19,8 @@ mod jack;
 
 pub(crate) use jack::JackAudioSystem;
 
+use crate::utils::{MediaClockTimestamp, PlayoutBufferReader, PlayoutBufferWriter};
 use tokio::sync::{mpsc, oneshot};
-
-use crate::utils::MediaClockTimestamp;
-
-use super::RxDescriptor;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RtpSample<S>(pub MediaClockTimestamp, pub S);
@@ -53,6 +50,6 @@ pub(crate) enum OutputEvent {
 }
 
 pub(crate) enum Message {
-    ActiveInputsChanged(Box<[bool]>),
-    ActiveOutputsChanged(Box<[Option<RxDescriptor>]>),
+    ActiveInputsChanged(Box<[Option<(usize, PlayoutBufferWriter)>]>),
+    ActiveOutputsChanged(Box<[Option<(usize, PlayoutBufferReader)>]>),
 }

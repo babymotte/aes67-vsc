@@ -143,6 +143,24 @@ pub async fn open_browser(ip: IpAddr, port: u16) {
     });
 }
 
+pub fn read_i32_sample(payload: &[u8]) -> i32 {
+    let padded = pad_sample(payload);
+    i32::from_be_bytes(padded)
+}
+
+pub fn read_f32_sample(payload: &[u8]) -> f32 {
+    let i = read_i32_sample(payload);
+    (i as f64 / i32::MAX as f64) as f32
+}
+
+fn pad_sample(payload: &[u8]) -> [u8; 4] {
+    let mut sample = [0, 0, 0, 0];
+    for (i, b) in payload.iter().enumerate() {
+        sample[i] = *b;
+    }
+    sample
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

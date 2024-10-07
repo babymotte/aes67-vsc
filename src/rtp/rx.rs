@@ -24,13 +24,12 @@ use crate::{
     actor::{respond, Actor, ActorApi},
     error::{RxError, RxResult},
     status::{Receiver, Status, StatusApi},
-    utils::{self, init_buffer, MediaClockTimestamp},
+    utils::{self, init_buffer, playout_buffer, PlayoutBufferReader, PlayoutBufferWriter},
     ReceiverId,
 };
 use core::f32;
 use lazy_static::lazy_static;
 use regex::Regex;
-use rtp_rs::RtpReader;
 use sdp::{
     description::common::{Address, ConnectionInformation},
     SessionDescription,
@@ -288,7 +287,6 @@ impl RtpRxApi {
         .expect("audio system failed");
 
         let sample_rate = audio_system.sample_rate();
-        let sample_reader = read_f32_sample;
 
         subsys.start(SubsystemBuilder::new("rtp/rx", move |s| async move {
             let cancel = s.create_cancellation_token();
@@ -300,7 +298,6 @@ impl RtpRxApi {
                 status,
                 recv_init_rx,
                 audio_system,
-                sample_reader,
                 local_ip,
                 msg_tx,
                 output_event_rx,
@@ -362,11 +359,10 @@ where
             mpsc::Sender<ReceiverMessage<RtpSample<SampleFormat>>>,
         )>],
     >,
-    sample_reader: fn(&[u8]) -> SampleFormat,
     matrix: OutputMatrix,
     port_txs: Box<[Option<mpsc::Sender<RtpSample<SampleFormat>>>]>,
     local_ip: Option<IpAddr>,
-    active_ports: Box<[Option<RxDescriptor>]>,
+    active_ports: Box<[Option<(usize, PlayoutBufferReader)>]>,
     msg_tx: mpsc::Sender<Message>,
     output_event_rx: mpsc::Receiver<OutputEvent>,
     sample_rate: usize,
@@ -437,7 +433,6 @@ where
         status: StatusApi,
         recv_init_rx: mpsc::Receiver<(usize, oneshot::Sender<Box<[mpsc::Receiver<RtpSample<S>>]>>)>,
         audio_system: AS,
-        sample_reader: fn(&[u8]) -> S,
         local_ip: Option<IpAddr>,
         msg_tx: mpsc::Sender<Message>,
         output_event_rx: mpsc::Receiver<OutputEvent>,
@@ -460,7 +455,6 @@ where
             _audio_system: audio_system,
             receiver_ids,
             active_receivers,
-            sample_reader,
             matrix,
             port_txs,
             local_ip,
@@ -558,7 +552,9 @@ where
             .auto_route(receiver_id, desc.channels, desc.clone())
             .expect("port availability must be checked first");
 
-        self.activate_ports(changed_ports).await?;
+        let (pob_writer, pob_reader) = playout_buffer(desc.clone());
+
+        self.activate_ports(changed_ports, pob_reader).await?;
 
         let (updates_tx, updates) = mpsc::channel(1);
         let mapping = self.get_channel_mapping(&desc);
@@ -566,14 +562,15 @@ where
             .send(ReceiverMessage::ChannelMapping(mapping))
             .await
             .ok();
+
         self.active_receivers[receiver_id] = Some((desc.clone(), updates_tx));
 
         let receive_loop = ReceiveLoop::new(
             desc.clone(),
             updates,
             socket,
-            self.sample_reader,
             self.status.clone(),
+            pob_writer,
         );
         spawn(receive_loop.run());
 
@@ -658,16 +655,17 @@ where
         Ok(())
     }
 
-    async fn activate_ports(&mut self, changed_ports: Vec<usize>) -> RxResult<()> {
+    async fn activate_ports(
+        &mut self,
+        changed_ports: Vec<usize>,
+        playout_buffer: PlayoutBufferReader,
+    ) -> RxResult<()> {
         for port in changed_ports {
-            self.active_ports[port] = Some(
-                self.matrix
-                    .mapping
-                    .get(&port)
-                    .expect("no descriptor for active port")
-                    .1
-                    .clone(),
-            );
+            self.active_ports[port] = self
+                .matrix
+                .mapping
+                .get(&port)
+                .map(|ch| (ch.0.channel_nr, playout_buffer.clone()));
         }
         self.msg_tx
             .send(Message::ActiveOutputsChanged(self.active_ports.clone()))
@@ -805,24 +803,6 @@ async fn create_rx_socket(
     Ok(tokio_socket)
 }
 
-fn pad_sample(payload: &[u8]) -> [u8; 4] {
-    let mut sample = [0, 0, 0, 0];
-    for (i, b) in payload.iter().enumerate() {
-        sample[i] = *b;
-    }
-    sample
-}
-
-fn read_i32_sample(payload: &[u8]) -> i32 {
-    let padded = pad_sample(payload);
-    i32::from_be_bytes(padded)
-}
-
-fn read_f32_sample(payload: &[u8]) -> f32 {
-    let i = read_i32_sample(payload);
-    (i as f64 / i32::MAX as f64) as f32
-}
-
 enum ReceiverMessage<S> {
     ChannelMapping(Box<[Box<[mpsc::Sender<S>]>]>),
     Stop,
@@ -838,7 +818,7 @@ struct ReceiveLoop<S: Copy> {
     status: StatusApi,
     out_of_order_packets: usize,
     dropped_packets: usize,
-    sample_reader: fn(&[u8]) -> S,
+    playout_buffer: PlayoutBufferWriter,
 }
 
 impl<S: Default> ReceiveLoop<S>
@@ -849,8 +829,8 @@ where
         desc: RxDescriptor,
         updates: mpsc::Receiver<ReceiverMessage<RtpSample<S>>>,
         socket: UdpSocket,
-        sample_reader: fn(&[u8]) -> S,
         status: StatusApi,
+        playout_buffer: PlayoutBufferWriter,
     ) -> Self {
         let rtp_buffer = init_buffer(desc.rtp_packet_size(), |_| 0u8);
         let port_transmitters = init_buffer(desc.channels, |_| vec![].into());
@@ -865,7 +845,7 @@ where
             status,
             out_of_order_packets: 0,
             dropped_packets: 0,
-            sample_reader,
+            playout_buffer,
         }
     }
 
@@ -886,29 +866,7 @@ where
     async fn process_packet(&mut self, len: usize, addr: SocketAddr) {
         self.update_buffer_usage();
         if addr.ip() == self.desc.origin_ip {
-            if let Ok(rtp) = RtpReader::new(&self.rtp_buffer[0..len]) {
-                let mut timestamp = MediaClockTimestamp::new(
-                    rtp.timestamp(),
-                    self.desc.sampling_rate,
-                    self.desc.link_offset,
-                );
-                for (i, raw_sample) in rtp
-                    .payload()
-                    .chunks(self.desc.bytes_per_sample())
-                    .enumerate()
-                {
-                    let sample = (self.sample_reader)(raw_sample);
-                    let channel = i % self.desc.channels;
-                    let playout_time = timestamp.playout_time();
-                    let port_transmitters = &self.port_transmitters[channel];
-                    for port_tx in port_transmitters {
-                        port_tx.send(RtpSample(playout_time, sample)).await.ok();
-                    }
-                    if channel == self.desc.channels - 1 {
-                        timestamp = timestamp.next();
-                    }
-                }
-            }
+            self.playout_buffer.insert(&self.rtp_buffer[0..len]);
         } else {
             log::warn!("Received packet from wrong sender: {addr}");
         }
