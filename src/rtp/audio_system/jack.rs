@@ -206,7 +206,7 @@ fn process(state: &mut State, client: &Client, ps: &ProcessScope) -> Control {
     // TODO is JACK clock monotonic?
 
     // severely out of sync, this will cause an audible jump
-    if drift.abs() >= 10 * client.buffer_size() as i64 {
+    if drift.abs() >= client.buffer_size() as i64 {
         log::warn!("JACK media clock is {drift} samples off, resetting it to system media clock");
         jack_media_clock = media_clock;
     } else
@@ -215,11 +215,7 @@ fn process(state: &mut State, client: &Client, ps: &ProcessScope) -> Control {
         // JACK media clock is BEHIND
         log::warn!("JACK media clock is {} samples late", drift.abs());
         jack_media_clock = jack_media_clock.next();
-    } else
-    // we tolerate a certain amount of being early since inserting samples
-    // with the current implementation is more disruptive than dropping some
-    // TODO make inserting samples more subtle and do it always
-    if drift > client.buffer_size() as i64 {
+    } else if drift > 0 {
         // JACK media clock is AHEAD
         log::warn!("JACK media clock is {} samples early", drift);
         jack_media_clock = jack_media_clock.previous();
