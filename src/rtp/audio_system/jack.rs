@@ -15,25 +15,28 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use super::{
-    AudioSystem, OutputEvent, ReceiverBufferInitCallback, RtpSample, TransmitterBufferInitCallback,
-};
+use std::time::Duration;
+
+use super::{AudioSystem, OutputEvent};
 use crate::{
     error::RtpResult,
-    ptp::statime_linux::SystemClock,
+    ptp::statime_linux::SharedOverlayClock,
     utils::{
-        frames_per_link_offset_buffer, init_buffer, read_f32_sample, set_realtime_priority,
-        MediaClockTimestamp, PlayoutBufferReader, PlayoutBufferWriter,
+        frames_per_link_offset_buffer, init_buffer, read_f32_sample, MediaClockTimestamp,
+        PlayoutBufferReader, PlayoutBufferWriter,
     },
 };
 use jack::{
     contrib::ClosureProcessHandler, AudioIn, AudioOut, Client, ClientOptions, Control, Frames,
     Port, ProcessScope,
 };
-use std::thread;
-use tokio::sync::{
-    mpsc::{self},
-    oneshot,
+use tokio::{
+    spawn,
+    sync::{
+        mpsc::{self},
+        oneshot,
+    },
+    time::sleep,
 };
 use tokio_graceful_shutdown::SubsystemHandle;
 
@@ -53,29 +56,23 @@ pub(crate) struct JackAudioSystem {
 struct State {
     _in_ports: Vec<Port<AudioIn>>,
     out_ports: Vec<Port<AudioOut>>,
-    _transmitters: Option<Box<[mpsc::Sender<f32>]>>,
-    _transmitter_init: TransmitterBufferInitCallback<f32>,
-    receivers: Option<Box<[mpsc::Receiver<RtpSample<f32>>]>>,
-    receiver_init: ReceiverBufferInitCallback<f32>,
     status: mpsc::Sender<OutputEvent>,
     msg_rx: mpsc::Receiver<Message>,
     active_inputs: Box<[Option<(usize, PlayoutBufferWriter)>]>,
     active_outputs: Box<[Option<(usize, PlayoutBufferReader)>]>,
     link_offset: f32,
     jack_media_clock: Option<MediaClockTimestamp>,
-    clock: SystemClock,
+    clock: SharedOverlayClock,
 }
 
 impl JackAudioSystem {
     pub(crate) fn new(
         _subsys: &SubsystemHandle,
         transmitters: usize,
-        _transmitter_init: TransmitterBufferInitCallback<f32>,
         receivers: usize,
-        receiver_init: ReceiverBufferInitCallback<f32>,
         status: mpsc::Sender<OutputEvent>,
         link_offset: f32,
-        clock: SystemClock,
+        clock: SharedOverlayClock,
     ) -> RtpResult<Self> {
         let active_inputs = init_buffer(transmitters, |_| None);
         let active_outputs = init_buffer(receivers, |_| None);
@@ -103,18 +100,12 @@ impl JackAudioSystem {
 
         let (msg_tx, msg_rx) = mpsc::channel(transmitters + receivers);
 
-        let _transmitters = None;
-        let receivers = None;
         let jack_media_clock = None;
 
         let process = ClosureProcessHandler::with_state(
             State {
                 _in_ports,
                 out_ports,
-                _transmitters,
-                _transmitter_init,
-                receivers,
-                receiver_init,
                 status,
                 active_inputs,
                 active_outputs,
@@ -124,18 +115,17 @@ impl JackAudioSystem {
                 clock,
             },
             process,
-            init_buffers,
+            |_, _, _| Control::Continue,
         );
 
         let (st, op) = oneshot::channel();
-        thread::spawn(|| {
-            set_realtime_priority();
 
-            let active_client = client.activate_async((), process).unwrap();
+        let active_client = client.activate_async((), process)?;
 
-            connect_ports(active_client.as_client());
-
-            op.blocking_recv().ok();
+        spawn(async move {
+            sleep(Duration::from_millis(200)).await;
+            connect_ports(active_client.as_client(), receivers);
+            op.await.ok();
             if let Err(e) = active_client.deactivate() {
                 log::error!("Error stopping JACK client: {e}");
             } else {
@@ -193,32 +183,6 @@ impl Drop for JackAudioSystem {
     }
 }
 
-fn init_buffers(state: &mut State, _: &Client, len: Frames) -> Control {
-    log::info!(
-        "Initializing JACK buffers on thread {:?}",
-        thread::current()
-    );
-
-    let (tx, rx) = oneshot::channel();
-    log::info!("Requesting receiver buffer …");
-    if let Err(e) = state.receiver_init.blocking_send((len as usize, tx)) {
-        log::error!("Could not initialize receiver buffer: {e}");
-        return Control::Quit;
-    }
-
-    match rx.blocking_recv() {
-        Ok(receivers) => state.receivers = Some(receivers),
-        Err(e) => {
-            log::error!("Could not initialize receiver buffer: {e}");
-            return Control::Quit;
-        }
-    }
-
-    log::info!("Receiver buffer initialized.");
-
-    Control::Continue
-}
-
 fn process(state: &mut State, client: &Client, ps: &ProcessScope) -> Control {
     let media_clock = state
         .clock
@@ -235,7 +199,7 @@ fn process(state: &mut State, client: &Client, ps: &ProcessScope) -> Control {
 
     // severely out of sync, this will cause an audible jump
     if drift.abs() >= client.buffer_size() as i64 {
-        log::debug!("JACK media clock is {drift} samples off, resetting it to system media clock");
+        log::warn!("JACK media clock is {drift} samples off, resetting it to system media clock");
         jack_media_clock = media_clock;
     } else
     // if jack clock is slightly off, bring them back together again
@@ -289,40 +253,10 @@ fn process(state: &mut State, client: &Client, ps: &ProcessScope) -> Control {
     Control::Continue
 }
 
-// fn compensate_clock_drift(
-//     state: &mut State,
-//     client: &Client,
-//     ps: &ProcessScope,
-// ) -> MediaClockTimestamp {
-//     let media_clock = MediaClockTimestamp::now(client.sample_rate(), state.link_offset);
-//     let jack_clock = ps.last_frame_time() as u64;
-//     let current_jack_clock_offset = jack_clock as i64 - media_clock.timestamp as i64;
-
-//     if state.jack_clock_offset != 0 {
-//         let drift = state.jack_clock_offset - current_jack_clock_offset;
-//         dbg!(drift);
-//         // let new_jack_clock_offset = if state.jack_clock_offset == 0 {
-//         //     current_jack_clock_offset
-//         // } else {
-//         //     (state.jack_clock_offset * 99 + current_jack_clock_offset) / 100
-//         // };
-//         // let drift = new_jack_clock_offset - state.jack_clock_offset;
-//         // if drift != 0 {
-//         //     log::warn!("JACK clock drift: {drift}");
-//         //     // TODO adjust media clock
-//         // }
-//         state.accumulated_jack_clock_offset += drift;
-//         dbg!(state.accumulated_jack_clock_offset);
-//         // media_clock.jump_to((jack_clock as i64 - new_jack_clock_offset) as u32)
-//     }
-
-//     state.jack_clock_offset = current_jack_clock_offset;
-//     media_clock
-// }
-
-fn connect_ports(client: &Client) {
+fn connect_ports(client: &Client, channels: usize) {
     // TODO set up routing according to persisted config
-    for i in 0..4 {
+
+    for i in 0..channels {
         let tx = format!("{CLIENT_NAME}:out{}", i + 1);
         let rx = format!("REAPER:in{}", i + 1);
 

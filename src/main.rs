@@ -34,7 +34,6 @@ use std::{io, time::Duration};
 use tikv_jemallocator::Jemalloc;
 use tokio::{select, sync::oneshot};
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle, Toplevel};
-use tracing_log::AsTrace;
 use tracing_subscriber::EnvFilter;
 use ui::ui;
 use uuid::Uuid;
@@ -47,8 +46,6 @@ static GLOBAL: Jemalloc = Jemalloc;
 #[derive(Parser)]
 #[command(author, version, about = "A virtual AES67 soundcard", long_about = None)]
 struct Args {
-    #[command(flatten)]
-    verbose: clap_verbosity_flag::Verbosity,
     /// The port to run the web UI on
     #[arg(short, long, default_value = "9090")]
     port: u16,
@@ -77,7 +74,6 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_writer(io::stderr)
-        .with_max_level(args.verbose.log_level_filter().as_trace())
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
@@ -169,7 +165,7 @@ async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
     .await
     .into_diagnostic()?;
 
-    let clock = ptp(iface, ip.ip()).await;
+    let clock = ptp(iface, ip.ip(), wb.clone(), wb_namespace_key.clone()).await;
     let status = StatusApi::new(&subsys, wb.clone(), topic!(wb_namespace_key, "status"))
         .into_diagnostic()?;
     let rtp_tx = RtpTxApi::new(&subsys, clock.clone()).into_diagnostic()?;

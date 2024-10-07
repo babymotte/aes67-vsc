@@ -1,11 +1,11 @@
-use clap::Parser;
 use fixed::traits::LossyInto;
+use pnet::datalink::NetworkInterface;
 use rand::{rngs::StdRng, SeedableRng};
 use statime::{
     config::{ClockIdentity, InstanceConfig, SdoId, TimePropertiesDS, TimeSource},
-    filters::{Filter, KalmanConfiguration, KalmanFilter},
+    filters::{KalmanConfiguration, KalmanFilter},
     port::{
-        is_message_buffer_compatible, InBmca, Measurement, Port, PortAction, PortActionIterator,
+        is_message_buffer_compatible, InBmca, Port, PortAction, PortActionIterator,
         TimestampContext, MAX_DATA_LEN,
     },
     time::Time,
@@ -13,7 +13,7 @@ use statime::{
 };
 use statime_linux::{
     clock::{LinuxClock, PortTimestampToTime},
-    config::Config,
+    config::{DelayType, NetworkMode, PortConfig},
     observer::ObservableInstanceState,
     socket::{
         open_ethernet_socket, open_ipv4_event_socket, open_ipv4_general_socket,
@@ -22,22 +22,22 @@ use statime_linux::{
     tlvforwarder::TlvForwarder,
 };
 use std::{
-    collections::HashMap,
     future::Future,
-    path::PathBuf,
+    net::{IpAddr, SocketAddr},
     pin::{pin, Pin},
     sync::RwLock,
 };
 use timestamped_socket::{
-    interface::interfaces,
+    interface::InterfaceName,
     networkaddress::{EthernetAddress, NetworkAddress},
     socket::{InterfaceTimestampMode, Open, Socket},
 };
 use tokio::{
     spawn,
-    sync::mpsc::{Receiver, Sender},
+    sync::mpsc::{self, Receiver, Sender},
     time::Sleep,
 };
+use worterbuch_client::{topic, Worterbuch};
 
 use crate::utils::{wrap_u128, MediaClockTimestamp};
 
@@ -57,19 +57,9 @@ impl PortClock for SharedClock<OverlayClock<LinuxClock>> {
     }
 }
 type BoxedClock = Box<dyn PortClock>;
-type SharedOverlayClock = SharedClock<OverlayClock<LinuxClock>>;
 
-#[derive(Parser, Debug)]
-#[clap(author, version, about, long_about = None)]
-pub struct Args {
-    /// Configuration file to use
-    #[clap(
-        long = "config",
-        short = 'c',
-        default_value = "/etc/statime/statime.toml"
-    )]
-    config_file: Option<PathBuf>,
-}
+#[derive(Clone)]
+pub struct SharedOverlayClock(SharedClock<OverlayClock<LinuxClock>>);
 
 pin_project_lite::pin_project! {
     struct Timer {
@@ -114,26 +104,13 @@ impl Future for Timer {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum SystemClock {
-    Linux(LinuxClock),
-    Overlay(SharedOverlayClock),
-}
-impl SystemClock {
+impl SharedOverlayClock {
     fn clone_boxed(&self) -> BoxedClock {
-        match self {
-            Self::Linux(clock) => Box::new(clock.clone()),
-            Self::Overlay(clock) => Box::new(clock.clone()),
-        }
+        Box::new(self.0.clone())
     }
 
     fn now_nanos(&self) -> u128 {
-        match self {
-            SystemClock::Linux(linux_clock) => todo!(),
-            SystemClock::Overlay(shared_clock) => {
-                shared_clock.now().nanos().saturating_round().lossy_into()
-            }
-        }
+        self.0.now().nanos().saturating_round().lossy_into()
     }
 
     pub fn media_clock(&self, sample_rate: usize, link_offset: f32) -> MediaClockTimestamp {
@@ -151,151 +128,37 @@ impl SystemClock {
     }
 }
 
-impl SystemClock {}
+pub async fn statime_linux(
+    iface: NetworkInterface,
+    ip: IpAddr,
+    wb: Worterbuch,
+    root_key: String,
+) -> SharedOverlayClock {
+    let mac = iface.mac.expect("we already checked this");
+    let mac = [mac.0, mac.1, mac.2, mac.3, mac.4, mac.5];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-enum ClockSyncMode {
-    #[default]
-    FromSystem,
-    ToSystem,
-}
-
-fn start_clock_task(
-    clock: LinuxClock,
-    system_clock: SystemClock,
-) -> tokio::sync::watch::Sender<ClockSyncMode> {
-    let (mode_sender, mode_receiver) = tokio::sync::watch::channel(ClockSyncMode::FromSystem);
-
-    match system_clock {
-        SystemClock::Linux(system_clock) => {
-            tokio::spawn(clock_task(clock, system_clock, None, mode_receiver));
-        }
-        SystemClock::Overlay(overlay_clock) => {
-            tokio::spawn(clock_task(
-                clock,
-                overlay_clock.clone(),
-                Some(overlay_clock),
-                mode_receiver,
-            ));
-        }
-    }
-
-    mode_sender
-}
-
-async fn clock_task<C: Clock<Error = impl core::fmt::Debug>>(
-    mut clock: LinuxClock,
-    mut system_clock: C,
-    system_clock_overlay: Option<SharedOverlayClock>,
-    mut mode_receiver: tokio::sync::watch::Receiver<ClockSyncMode>,
-) {
-    let mut measurement_timer = pin!(Timer::new());
-    let mut update_timer = pin!(Timer::new());
-
-    measurement_timer.as_mut().reset(std::time::Duration::ZERO);
-
-    let mut filter = KalmanFilter::new(KalmanConfiguration::default());
-
-    let mut current_mode = *mode_receiver.borrow_and_update();
-    loop {
-        tokio::select! {
-            () = &mut measurement_timer => {
-                let (raw_t1, t2, raw_t3) = clock.system_offset().expect("Unable to determine offset from system clock");
-                let (t1, t3) = match &system_clock_overlay {
-                    Some(shared) => {
-                        let overlay = shared.0.lock().expect("shared clock lock is tainted");
-                        (overlay.time_from_underlying(raw_t1), overlay.time_from_underlying(raw_t3))
-                    },
-                    None => (raw_t1, raw_t3)
-                };
-
-                log::debug!("Interclock measurement: {} {} {}", t1, t2, t3);
-
-                let delay = (t3-t1)/2;
-                let offset_a = t2 - t1;
-                let offset_b = t3 - t2;
-
-                let update = match current_mode {
-                    ClockSyncMode::FromSystem => {
-                        let m = Measurement {
-                            event_time: t2,
-                            offset: Some(offset_a - delay),
-                            delay: Some(delay),
-                            peer_delay: None,
-                            raw_sync_offset: Some(offset_a),
-                            raw_delay_offset: Some(-offset_b),
-                        };
-                        filter.measurement(m, &mut clock)
-                    },
-                    ClockSyncMode::ToSystem => {
-                        let m = Measurement {
-                            event_time: t1+delay,
-                            offset: Some(offset_b - delay),
-                            delay: Some(delay),
-                            peer_delay: None,
-                            raw_sync_offset: Some(offset_b),
-                            raw_delay_offset: Some(-offset_a),
-                        };
-                        filter.measurement(m, &mut system_clock)
-                    },
-                };
-
-                if let Some(timeout) = update.next_update {
-                    update_timer.as_mut().reset(timeout);
-                }
-
-                measurement_timer.as_mut().reset(std::time::Duration::from_millis(250));
-            }
-            () = &mut update_timer => {
-                let update = match current_mode {
-                    ClockSyncMode::FromSystem => filter.update(&mut clock),
-                    ClockSyncMode::ToSystem => filter.update(&mut system_clock),
-                };
-                if let Some(timeout) = update.next_update {
-                    update_timer.as_mut().reset(timeout);
-                }
-            }
-            _ = mode_receiver.changed() => {
-                let new_mode = *mode_receiver.borrow_and_update();
-                if new_mode != current_mode {
-                    let mut new_filter = KalmanFilter::new(KalmanConfiguration::default());
-                    std::mem::swap(&mut filter, &mut new_filter);
-                    match current_mode {
-                        ClockSyncMode::FromSystem => new_filter.demobilize(&mut clock),
-                        ClockSyncMode::ToSystem => new_filter.demobilize(&mut system_clock)
-                    };
-                    current_mode = new_mode;
-                }
-            }
-        }
-    }
-}
-
-pub async fn statime_linux(config: Config) -> SystemClock {
-    let clock_identity = config.identity.unwrap_or(ClockIdentity(
-        get_clock_id().expect("could not get clock identity"),
-    ));
+    let clock_identity = ClockIdentity::from_mac_address(mac);
+    let path_trace = true;
+    let port_config = port_config(ip);
+    let sdo_id = 0x000;
 
     log::info!("Clock identity: {}", hex::encode(clock_identity.0));
 
     let instance_config = InstanceConfig {
         clock_identity,
-        priority_1: config.priority1,
-        priority_2: config.priority2,
-        domain_number: config.domain,
+        priority_1: 255,
+        priority_2: 255,
+        domain_number: 0,
         slave_only: false,
-        sdo_id: SdoId::try_from(config.sdo_id).expect("sdo-id should be between 0 and 4095"),
-        path_trace: config.path_trace,
+        sdo_id: SdoId::try_from(sdo_id).expect("sdo-id should be between 0 and 4095"),
+        path_trace,
     };
 
     let time_properties_ds =
         TimePropertiesDS::new_arbitrary_time(false, false, TimeSource::InternalOscillator);
 
-    let system_clock = if config.virtual_system_clock {
-        SystemClock::Overlay(SharedClock::new(OverlayClock::new(LinuxClock::CLOCK_TAI)))
-    } else {
-        SystemClock::Linux(LinuxClock::CLOCK_TAI)
-    };
+    let system_clock =
+        SharedOverlayClock(SharedClock::new(OverlayClock::new(LinuxClock::CLOCK_TAI)));
 
     // Leak to get a static reference, the ptp instance will be around for the rest
     // of the program anyway
@@ -305,128 +168,85 @@ pub async fn statime_linux(config: Config) -> SystemClock {
     )));
 
     // The observer for the metrics exporter
-    let (instance_state_sender, instance_state_receiver) =
-        tokio::sync::watch::channel(ObservableInstanceState {
-            default_ds: instance.default_ds(),
-            current_ds: instance.current_ds(),
-            parent_ds: instance.parent_ds(),
-            time_properties_ds: instance.time_properties_ds(),
-            path_trace_ds: instance.path_trace_ds(),
-        });
-    statime_linux::observer::spawn(&config, instance_state_receiver).await;
+    let (instance_state_sender, instance_state_receiver) = mpsc::channel(1);
+
+    publish_stats(instance_state_receiver, wb, root_key);
 
     let (bmca_notify_sender, bmca_notify_receiver) = tokio::sync::watch::channel(false);
 
-    let mut main_task_senders = Vec::with_capacity(config.ports.len());
-    let mut main_task_receivers = Vec::with_capacity(config.ports.len());
-
-    let mut internal_sync_senders = vec![];
-
-    let mut clock_name_map = HashMap::new();
-    let mut clock_port_map = Vec::with_capacity(config.ports.len());
-
-    let mut ports = Vec::with_capacity(config.ports.len());
+    // let mut main_task_senders = Vec::with_capacity(1);
+    // let mut main_task_receivers = Vec::with_capacity(1);
+    // let mut ports = Vec::with_capacity(1);
 
     let tlv_forwarder = TlvForwarder::new();
 
-    for port_config in config.ports {
-        let interface = port_config.interface;
-        let network_mode = port_config.network_mode;
-        let (port_clock, timestamping) = match port_config.hardware_clock {
-            Some(idx) => {
-                let mut clock = LinuxClock::open_idx(idx).expect("Unable to open clock");
-                if let Some(id) = clock_name_map.get(&idx) {
-                    clock_port_map.push(Some(*id));
-                } else {
-                    clock.init().expect("Unable to initialize clock");
-                    let id = internal_sync_senders.len();
-                    clock_port_map.push(Some(id));
-                    clock_name_map.insert(idx, id);
-                    internal_sync_senders
-                        .push(start_clock_task(clock.clone(), system_clock.clone()));
-                }
-                (
-                    Box::new(clock) as BoxedClock,
-                    InterfaceTimestampMode::HardwarePTPAll,
-                )
-            }
-            None => {
-                clock_port_map.push(None);
-                (
-                    system_clock.clone_boxed(),
-                    InterfaceTimestampMode::SoftwareAll,
-                )
-            }
-        };
+    let interface = port_config.interface;
+    let network_mode = port_config.network_mode;
+    let (port_clock, timestamping) = (
+        system_clock.clone_boxed(),
+        InterfaceTimestampMode::SoftwareAll,
+    );
 
-        let rng = StdRng::from_entropy();
-        let bind_phc = port_config.hardware_clock;
-        let port = instance.add_port(
-            port_config.into(),
-            KalmanConfiguration::default(),
-            port_clock.clone_box(),
-            rng,
-        );
+    let rng = StdRng::from_entropy();
+    let bind_phc = port_config.hardware_clock;
+    let port = instance.add_port(
+        port_config.into(),
+        KalmanConfiguration::default(),
+        port_clock.clone_box(),
+        rng,
+    );
 
-        let (main_task_sender, port_task_receiver) = tokio::sync::mpsc::channel(1);
-        let (port_task_sender, main_task_receiver) = tokio::sync::mpsc::channel(1);
+    let (main_task_sender, port_task_receiver) = tokio::sync::mpsc::channel(1);
+    let (port_task_sender, main_task_receiver) = tokio::sync::mpsc::channel(1);
 
-        // We can't send the port yet, since that may start running on the port,
-        // inhibiting write access to the instance and making it impossible to
-        // create more ports.
-        ports.push(port);
-        main_task_senders.push(main_task_sender);
-        main_task_receivers.push(main_task_receiver);
+    match network_mode {
+        statime_linux::config::NetworkMode::Ipv4 => {
+            let event_socket = open_ipv4_event_socket(interface, timestamping, bind_phc)
+                .expect("Could not open event socket");
+            let general_socket =
+                open_ipv4_general_socket(interface).expect("Could not open general socket");
 
-        match network_mode {
-            statime_linux::config::NetworkMode::Ipv4 => {
-                let event_socket = open_ipv4_event_socket(interface, timestamping, bind_phc)
-                    .expect("Could not open event socket");
-                let general_socket =
-                    open_ipv4_general_socket(interface).expect("Could not open general socket");
+            tokio::spawn(port_task(
+                port_task_receiver,
+                port_task_sender,
+                event_socket,
+                general_socket,
+                bmca_notify_receiver.clone(),
+                tlv_forwarder.duplicate(),
+                port_clock,
+            ));
+        }
+        statime_linux::config::NetworkMode::Ipv6 => {
+            let event_socket = open_ipv6_event_socket(interface, timestamping, bind_phc)
+                .expect("Could not open event socket");
+            let general_socket =
+                open_ipv6_general_socket(interface).expect("Could not open general socket");
 
-                tokio::spawn(port_task(
-                    port_task_receiver,
-                    port_task_sender,
-                    event_socket,
-                    general_socket,
-                    bmca_notify_receiver.clone(),
-                    tlv_forwarder.duplicate(),
-                    port_clock,
-                ));
-            }
-            statime_linux::config::NetworkMode::Ipv6 => {
-                let event_socket = open_ipv6_event_socket(interface, timestamping, bind_phc)
-                    .expect("Could not open event socket");
-                let general_socket =
-                    open_ipv6_general_socket(interface).expect("Could not open general socket");
+            tokio::spawn(port_task(
+                port_task_receiver,
+                port_task_sender,
+                event_socket,
+                general_socket,
+                bmca_notify_receiver.clone(),
+                tlv_forwarder.duplicate(),
+                port_clock,
+            ));
+        }
+        statime_linux::config::NetworkMode::Ethernet => {
+            let socket = open_ethernet_socket(interface, timestamping, bind_phc)
+                .expect("Could not open socket");
 
-                tokio::spawn(port_task(
-                    port_task_receiver,
-                    port_task_sender,
-                    event_socket,
-                    general_socket,
-                    bmca_notify_receiver.clone(),
-                    tlv_forwarder.duplicate(),
-                    port_clock,
-                ));
-            }
-            statime_linux::config::NetworkMode::Ethernet => {
-                let socket = open_ethernet_socket(interface, timestamping, bind_phc)
-                    .expect("Could not open socket");
-
-                tokio::spawn(ethernet_port_task(
-                    port_task_receiver,
-                    port_task_sender,
-                    interface
-                        .get_index()
-                        .expect("Unable to get network interface index") as _,
-                    socket,
-                    bmca_notify_receiver.clone(),
-                    tlv_forwarder.duplicate(),
-                    port_clock,
-                ));
-            }
+            tokio::spawn(ethernet_port_task(
+                port_task_receiver,
+                port_task_sender,
+                interface
+                    .get_index()
+                    .expect("Unable to get network interface index") as _,
+                socket,
+                bmca_notify_receiver.clone(),
+                tlv_forwarder.duplicate(),
+                port_clock,
+            ));
         }
     }
 
@@ -434,21 +254,17 @@ pub async fn statime_linux(config: Config) -> SystemClock {
     drop(tlv_forwarder);
 
     // All ports created, so we can start running them.
-    for (i, port) in ports.into_iter().enumerate() {
-        main_task_senders[i]
-            .send(port)
-            .await
-            .expect("space in channel buffer");
-    }
+    main_task_sender
+        .send(port)
+        .await
+        .expect("space in channel buffer");
 
     spawn(run(
         instance,
         bmca_notify_sender,
         instance_state_sender,
-        main_task_receivers,
-        main_task_senders,
-        internal_sync_senders,
-        clock_port_map,
+        main_task_receiver,
+        main_task_sender,
     ));
 
     system_clock
@@ -457,11 +273,9 @@ pub async fn statime_linux(config: Config) -> SystemClock {
 async fn run(
     instance: &'static PtpInstance<KalmanFilter, RwLock<PtpInstanceState>>,
     bmca_notify_sender: tokio::sync::watch::Sender<bool>,
-    instance_state_sender: tokio::sync::watch::Sender<ObservableInstanceState>,
-    mut main_task_receivers: Vec<Receiver<BmcaPort>>,
-    main_task_senders: Vec<Sender<BmcaPort>>,
-    internal_sync_senders: Vec<tokio::sync::watch::Sender<ClockSyncMode>>,
-    clock_port_map: Vec<Option<usize>>,
+    instance_state_sender: mpsc::Sender<ObservableInstanceState>,
+    mut main_task_receiver: Receiver<BmcaPort>,
+    main_task_sender: Sender<BmcaPort>,
 ) -> ! {
     // run bmca over all of the ports at the same time. The ports don't perform
     // their normal actions at this time: bmca is stop-the-world!
@@ -479,51 +293,32 @@ async fn run(
             .send(true)
             .expect("Bmca notification failed");
 
-        let mut bmca_ports = Vec::with_capacity(main_task_receivers.len());
-        let mut mut_bmca_ports = Vec::with_capacity(main_task_receivers.len());
-
-        for receiver in main_task_receivers.iter_mut() {
-            bmca_ports.push(receiver.recv().await.unwrap());
-        }
+        let mut bmca_port = main_task_receiver.recv().await.unwrap();
+        let mut mut_bmca_ports = vec![&mut bmca_port];
 
         // have all ports so deassert stop
         bmca_notify_sender
             .send(false)
             .expect("Bmca notification failed");
 
-        for mut_bmca_port in bmca_ports.iter_mut() {
-            mut_bmca_ports.push(mut_bmca_port);
-        }
-
         instance.bmca(&mut mut_bmca_ports);
 
         // Update instance state for observability
         // We don't care if isn't anybody on the other side
-        let _ = instance_state_sender.send(ObservableInstanceState {
-            default_ds: instance.default_ds(),
-            current_ds: instance.current_ds(),
-            parent_ds: instance.parent_ds(),
-            time_properties_ds: instance.time_properties_ds(),
-            path_trace_ds: instance.path_trace_ds(),
-        });
-
-        let mut clock_states = vec![ClockSyncMode::FromSystem; internal_sync_senders.len()];
-        for (idx, port) in mut_bmca_ports.iter().enumerate() {
-            if port.is_steering() {
-                if let Some(id) = clock_port_map[idx] {
-                    clock_states[id] = ClockSyncMode::ToSystem;
-                }
-            }
-        }
-        for (mode, sender) in clock_states.into_iter().zip(internal_sync_senders.iter()) {
-            sender.send(mode).expect("Clock mode change failed");
-        }
+        instance_state_sender
+            .send(ObservableInstanceState {
+                default_ds: instance.default_ds(),
+                current_ds: instance.current_ds(),
+                parent_ds: instance.parent_ds(),
+                time_properties_ds: instance.time_properties_ds(),
+                path_trace_ds: instance.path_trace_ds(),
+            })
+            .await
+            .ok();
 
         drop(mut_bmca_ports);
 
-        for (port, sender) in bmca_ports.into_iter().zip(main_task_senders.iter()) {
-            sender.send(port).await.unwrap();
-        }
+        main_task_sender.send(bmca_port).await.unwrap();
     }
 }
 
@@ -946,19 +741,222 @@ async fn handle_actions_ethernet(
     pending_timestamp
 }
 
-fn get_clock_id() -> Option<[u8; 8]> {
-    let candidates = interfaces()
-        .unwrap()
-        .into_iter()
-        .filter_map(|(_, data)| data.mac());
+fn port_config(ip: IpAddr) -> PortConfig {
+    let interface = InterfaceName::from_socket_addr(SocketAddr::new(ip, 9091))
+        .expect("no interface")
+        .expect("no interface");
+    let acceptable_master_list = None;
+    let hardware_clock = None;
+    let network_mode = NetworkMode::Ipv4;
+    let announce_interval = 1;
+    let sync_interval = 0;
+    let announce_receipt_timeout = 3;
+    let master_only = false;
+    let delay_asymmetry = 0;
+    let delay_mechanism = DelayType::E2E;
+    let delay_interval = 1;
 
-    for mac in candidates {
-        // Ignore multicast and locally administered mac addresses
-        if mac[0] & 0x3 == 0 && mac.iter().any(|x| *x != 0) {
-            let f = |i| mac.get(i).copied().unwrap_or_default();
-            return Some(std::array::from_fn(f));
-        }
+    PortConfig {
+        interface,
+        acceptable_master_list,
+        hardware_clock,
+        network_mode,
+        announce_interval,
+        sync_interval,
+        announce_receipt_timeout,
+        master_only,
+        delay_asymmetry,
+        delay_mechanism,
+        delay_interval,
     }
+}
 
-    None
+fn publish_stats(
+    mut instance_state_receiver: mpsc::Receiver<ObservableInstanceState>,
+    wb: Worterbuch,
+    root_key: String,
+) {
+    spawn(async move {
+        while let Some(stats) = instance_state_receiver.recv().await {
+            wb.publish(
+                topic!(root_key, "status", "ptp", "current", "offsetFromMaster"),
+                &stats.current_ds.offset_from_master,
+            )
+            .await
+            .ok();
+            wb.publish(
+                topic!(root_key, "status", "ptp", "current", "stepsRemoved"),
+                &stats.current_ds.steps_removed,
+            )
+            .await
+            .ok();
+
+            wb.set(
+                topic!(root_key, "status", "ptp", "default", "clock", "id"),
+                &stats.default_ds.clock_identity,
+            )
+            .await
+            .ok();
+            wb.set(
+                topic!(root_key, "status", "ptp", "default", "clock", "quality"),
+                &stats.default_ds.clock_quality,
+            )
+            .await
+            .ok();
+            wb.set(
+                topic!(root_key, "status", "ptp", "default", "domain"),
+                &stats.default_ds.domain_number,
+            )
+            .await
+            .ok();
+            wb.set(
+                topic!(root_key, "status", "ptp", "default", "ports"),
+                &stats.default_ds.number_ports,
+            )
+            .await
+            .ok();
+            wb.set(
+                topic!(root_key, "status", "ptp", "default", "priority1"),
+                &stats.default_ds.priority_1,
+            )
+            .await
+            .ok();
+            wb.set(
+                topic!(root_key, "status", "ptp", "default", "priority2"),
+                &stats.default_ds.priority_2,
+            )
+            .await
+            .ok();
+            wb.set(
+                topic!(root_key, "status", "ptp", "default", "sdoID"),
+                &stats.default_ds.sdo_id,
+            )
+            .await
+            .ok();
+            wb.set(
+                topic!(root_key, "status", "ptp", "default", "slaveOnly"),
+                &stats.default_ds.slave_only,
+            )
+            .await
+            .ok();
+
+            wb.set(
+                topic!(
+                    root_key,
+                    "status",
+                    "ptp",
+                    "parent",
+                    "grandmaster",
+                    "clock",
+                    "quality"
+                ),
+                &stats.parent_ds.grandmaster_clock_quality,
+            )
+            .await
+            .ok();
+            wb.set(
+                topic!(root_key, "status", "ptp", "parent", "grandmaster", "id"),
+                &stats.parent_ds.grandmaster_identity,
+            )
+            .await
+            .ok();
+            wb.set(
+                topic!(
+                    root_key,
+                    "status",
+                    "ptp",
+                    "parent",
+                    "grandmaster",
+                    "priority1"
+                ),
+                &stats.parent_ds.grandmaster_priority_1,
+            )
+            .await
+            .ok();
+            wb.set(
+                topic!(
+                    root_key,
+                    "status",
+                    "ptp",
+                    "parent",
+                    "grandmaster",
+                    "priority2"
+                ),
+                &stats.parent_ds.grandmaster_priority_2,
+            )
+            .await
+            .ok();
+            wb.set(
+                topic!(root_key, "status", "ptp", "parent", "port", "id"),
+                &stats.parent_ds.parent_port_identity,
+            )
+            .await
+            .ok();
+
+            wb.set(
+                topic!(root_key, "status", "ptp", "pathTrace", "enabled"),
+                &stats.path_trace_ds.enable,
+            )
+            .await
+            .ok();
+            wb.set(
+                topic!(root_key, "status", "ptp", "pathTrace", "list"),
+                &stats.path_trace_ds.list,
+            )
+            .await
+            .ok();
+
+            wb.publish(
+                topic!(root_key, "status", "ptp", "time", "properties", "utcOffset"),
+                &stats.time_properties_ds.current_utc_offset,
+            )
+            .await
+            .ok();
+            wb.set(
+                topic!(
+                    root_key,
+                    "status",
+                    "ptp",
+                    "time",
+                    "properties",
+                    "frequencyTraceable"
+                ),
+                &stats.time_properties_ds.frequency_traceable,
+            )
+            .await
+            .ok();
+            wb.set(
+                topic!(root_key, "status", "ptp", "time", "properties", "isPtp"),
+                &stats.time_properties_ds.is_ptp(),
+            )
+            .await
+            .ok();
+            wb.set(
+                topic!(
+                    root_key,
+                    "status",
+                    "ptp",
+                    "time",
+                    "properties",
+                    "leadIndicator"
+                ),
+                &stats.time_properties_ds.leap_indicator,
+            )
+            .await
+            .ok();
+            wb.set(
+                topic!(
+                    root_key,
+                    "status",
+                    "ptp",
+                    "time",
+                    "properties",
+                    "timeTraceable"
+                ),
+                &stats.time_properties_ds.time_traceable,
+            )
+            .await
+            .ok();
+        }
+    });
 }

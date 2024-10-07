@@ -16,14 +16,14 @@
  */
 
 use super::{
-    audio_system::{AudioSystem, JackAudioSystem, OutputEvent, RtpSample},
+    audio_system::{AudioSystem, JackAudioSystem, OutputEvent},
     socket::{create_ipv4_rx_socket, create_ipv6_rx_socket},
     OutputMatrix,
 };
 use crate::{
     actor::{respond, Actor, ActorApi},
     error::{RxError, RxResult},
-    ptp::statime_linux::SystemClock,
+    ptp::statime_linux::SharedOverlayClock,
     status::{Receiver, Status, StatusApi},
     utils::{self, init_buffer, playout_buffer, PlayoutBufferReader, PlayoutBufferWriter},
     ReceiverId,
@@ -49,7 +49,7 @@ use tokio::{
     },
     time::interval,
 };
-use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
+use tokio_graceful_shutdown::{NestedSubsystem, SubsystemBuilder, SubsystemHandle};
 use tokio_util::sync::CancellationToken;
 
 lazy_static! {
@@ -263,7 +263,7 @@ impl ActorApi for RtpRxApi {
 impl RtpRxApi {
     pub fn new(
         subsys: &SubsystemHandle,
-        clock: SystemClock,
+        clock: SharedOverlayClock,
         max_channels: usize,
         link_offset: f32,
         status: StatusApi,
@@ -271,16 +271,12 @@ impl RtpRxApi {
     ) -> Result<Self, RxError> {
         let (channel, commands) = mpsc::channel(1);
 
-        let (trans_init_tx, _trans_init_rx) = mpsc::channel(max_channels);
-        let (recv_init_tx, recv_init_rx) = mpsc::channel(max_channels);
         let (output_event_tx, output_event_rx) = mpsc::channel(1000);
 
         let audio_system = JackAudioSystem::new(
             &subsys,
             0,
-            trans_init_tx,
             max_channels,
-            recv_init_tx,
             output_event_tx,
             link_offset,
             clock,
@@ -291,13 +287,12 @@ impl RtpRxApi {
 
         subsys.start(SubsystemBuilder::new("rtp/rx", move |s| async move {
             let cancel = s.create_cancellation_token();
-            let mut actor: RtpRxActor<JackAudioSystem, f32> = RtpRxActor::new(
+            let mut actor: RtpRxActor<JackAudioSystem> = RtpRxActor::new(
                 s,
                 commands,
                 max_channels,
                 link_offset,
                 status,
-                recv_init_rx,
                 audio_system,
                 local_ip,
                 output_event_rx,
@@ -336,10 +331,11 @@ pub enum RxConfig {
     LinkOffset(usize),
 }
 
-struct RtpRxActor<AS, SampleFormat>
+type RxSubsysErr = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+struct RtpRxActor<AS>
 where
     AS: AudioSystem,
-    SampleFormat: Copy + Default + Send + Sync + 'static,
 {
     commands: mpsc::Receiver<RxFunction>,
     max_channels: usize,
@@ -347,40 +343,28 @@ where
     link_offset: f32,
     status: StatusApi,
     subsys: SubsystemHandle,
-    recv_init_rx: mpsc::Receiver<(
-        usize,
-        oneshot::Sender<Box<[mpsc::Receiver<RtpSample<SampleFormat>>]>>,
-    )>,
     audio_system: AS,
     receiver_ids: HashMap<String, ReceiverId>,
-    active_receivers: Box<
-        [Option<(
-            RxDescriptor,
-            mpsc::Sender<ReceiverMessage<RtpSample<SampleFormat>>>,
-        )>],
-    >,
+    active_receivers: Box<[Option<(RxDescriptor, NestedSubsystem<RxSubsysErr>)>]>,
     matrix: OutputMatrix,
-    port_txs: Box<[Option<mpsc::Sender<RtpSample<SampleFormat>>>]>,
     local_ip: IpAddr,
     active_ports: Box<[Option<(usize, PlayoutBufferReader)>]>,
     output_event_rx: mpsc::Receiver<OutputEvent>,
     sample_rate: usize,
 }
 
-impl<AS, S> Drop for RtpRxActor<AS, S>
+impl<AS> Drop for RtpRxActor<AS>
 where
     AS: AudioSystem,
-    S: Copy + Default + Send + Sync + 'static,
 {
     fn drop(&mut self) {
         self.subsys.request_shutdown();
     }
 }
 
-impl<AS, S> Actor for RtpRxActor<AS, S>
+impl<AS> Actor for RtpRxActor<AS>
 where
     AS: AudioSystem,
-    S: Copy + Default + Send + Sync + 'static,
 {
     type Message = RxFunction;
     type Error = RxError;
@@ -406,10 +390,6 @@ where
                 Some(msg) = self.commands.recv() => if !self.process_message(msg).await {
                     break;
                 },
-                Some((buffer_size,tx)) = self.recv_init_rx.recv() => {
-                    log::info!("Initializing receiver channel buffer …");
-                    tx.send(self.initialize_receiver_buffer(self.max_channels, buffer_size, self.sample_rate).await?).ok();
-                },
                 Some(output_event) = self.output_event_rx.recv() => self.process_output_event(output_event).await,
                 else => break,
             }
@@ -419,10 +399,9 @@ where
     }
 }
 
-impl<AS, S> RtpRxActor<AS, S>
+impl<AS> RtpRxActor<AS>
 where
     AS: AudioSystem,
-    S: Copy + Default + Send + Sync + 'static,
 {
     fn new(
         subsys: SubsystemHandle,
@@ -430,7 +409,6 @@ where
         max_channels: usize,
         link_offset: f32,
         status: StatusApi,
-        recv_init_rx: mpsc::Receiver<(usize, oneshot::Sender<Box<[mpsc::Receiver<RtpSample<S>>]>>)>,
         audio_system: AS,
         local_ip: IpAddr,
         output_event_rx: mpsc::Receiver<OutputEvent>,
@@ -439,7 +417,6 @@ where
         let receiver_ids = HashMap::new();
         let active_receivers = init_buffer(max_channels, |_| None);
         let matrix = OutputMatrix::default(max_channels);
-        let port_txs = init_buffer(max_channels, |_| None);
         let active_ports = init_buffer(max_channels, |_| None);
 
         RtpRxActor {
@@ -449,12 +426,10 @@ where
             used_channels: 0,
             link_offset,
             status,
-            recv_init_rx,
             audio_system,
             receiver_ids,
             active_receivers,
             matrix,
-            port_txs,
             local_ip,
             active_ports,
             output_event_rx,
@@ -480,40 +455,6 @@ where
                 }
             }
         }
-    }
-
-    async fn initialize_receiver_buffer(
-        &mut self,
-        channels: usize,
-        buffer_size: usize,
-        sample_rate: usize,
-    ) -> RxResult<Box<[mpsc::Receiver<RtpSample<S>>]>> {
-        let mut senders = vec![];
-        let mut receivers = vec![];
-
-        for _ in 0..channels {
-            // TODO get and use audio system sample rate
-            let channel_buffer_size =
-                utils::frames_per_link_offset_buffer(self.link_offset, sample_rate)
-                    .max(buffer_size);
-            let (tx, rx) = mpsc::channel(channel_buffer_size);
-            senders.push(Some(tx));
-            receivers.push(rx);
-        }
-
-        self.port_txs = senders.into();
-
-        for rec in &self.active_receivers {
-            if let Some((desc, updates)) = rec {
-                let mapping = self.get_channel_mapping(desc);
-                updates
-                    .send(ReceiverMessage::ChannelMapping(mapping))
-                    .await
-                    .ok();
-            }
-        }
-
-        Ok(receivers.into())
     }
 
     async fn create_receiver(&mut self, sdp: SessionDescription) -> RxResult<()> {
@@ -553,23 +494,18 @@ where
 
         self.activate_ports(changed_ports, pob_reader).await;
 
-        let (updates_tx, updates) = mpsc::channel(1);
-        let mapping = self.get_channel_mapping(&desc);
-        updates_tx
-            .send(ReceiverMessage::ChannelMapping(mapping))
-            .await
-            .ok();
+        let rx_desc = desc.clone();
+        let rx_stat = self.status.clone();
+        let subsys = move |s| async move {
+            let receive_loop = ReceiveLoop::new(rx_desc, socket, rx_stat, pob_writer);
+            receive_loop.run(s).await;
+            Ok::<(), RxError>(())
+        };
+        let rx_subsys: NestedSubsystem<RxSubsysErr> = self
+            .subsys
+            .start(SubsystemBuilder::new(receiver_id.to_string(), subsys));
 
-        self.active_receivers[receiver_id] = Some((desc.clone(), updates_tx));
-
-        let receive_loop = ReceiveLoop::new(
-            desc.clone(),
-            updates,
-            socket,
-            self.status.clone(),
-            pob_writer,
-        );
-        spawn(receive_loop.run());
+        self.active_receivers[receiver_id] = Some((desc.clone(), rx_subsys));
 
         self.status
             .publish(Status::Receiver(Receiver::Created(
@@ -583,45 +519,24 @@ where
         Ok(())
     }
 
-    fn get_channel_mapping(&self, desc: &RxDescriptor) -> Box<[Box<[mpsc::Sender<RtpSample<S>>]>]> {
-        let mut mapping = vec![vec![]; desc.channels];
-
-        for ch_nr in 0..desc.channels {
-            for (port, (ch, _)) in &self.matrix.mapping {
-                if ch.transceiver_id == desc.id && ch_nr == ch.channel_nr {
-                    if let Some(tx) = &self.port_txs[*port] {
-                        mapping[ch_nr].push(tx.to_owned());
-                        log::info!("{ch:?} => {port}")
-                    }
-                }
-            }
-        }
-
-        mapping
-            .into_iter()
-            .map(Box::from)
-            .collect::<Vec<Box<[mpsc::Sender<RtpSample<S>>]>>>()
-            .into()
-    }
-
     async fn delete_receiver(&mut self, receiver_id: ReceiverId) -> RxResult<()> {
         if receiver_id >= self.active_receivers.len() {
             return Err(RxError::InvalidReceiverId(receiver_id));
         }
 
-        if let Some((desc, updates)) = self.active_receivers[receiver_id].take() {
+        if let Some((desc, subsys)) = self.active_receivers[receiver_id].take() {
             log::info!(
                 "Deleting receiver '{receiver_id}' for session '{}' …",
                 desc.session_id
             );
+
+            subsys.initiate_shutdown();
 
             let changed_ports = self.matrix.auto_unroute(receiver_id);
 
             self.deactivate_ports(changed_ports).await;
 
             self.receiver_ids.remove(&desc.session_id());
-
-            updates.send(ReceiverMessage::Stop).await.ok();
 
             self.used_channels -= desc.channels;
 
@@ -790,17 +705,10 @@ async fn create_rx_socket(
     Ok(tokio_socket)
 }
 
-enum ReceiverMessage<S> {
-    ChannelMapping(Box<[Box<[mpsc::Sender<S>]>]>),
-    Stop,
-}
-
-struct ReceiveLoop<S: Copy> {
+struct ReceiveLoop {
     desc: RxDescriptor,
-    updates: mpsc::Receiver<ReceiverMessage<RtpSample<S>>>,
     socket: UdpSocket,
     rtp_buffer: Box<[u8]>,
-    port_transmitters: Box<[Box<[mpsc::Sender<RtpSample<S>>]>]>,
     min_buffer_usage: (usize, usize),
     status: StatusApi,
     out_of_order_packets: usize,
@@ -808,26 +716,19 @@ struct ReceiveLoop<S: Copy> {
     playout_buffer: PlayoutBufferWriter,
 }
 
-impl<S: Default> ReceiveLoop<S>
-where
-    S: Copy,
-{
+impl ReceiveLoop {
     fn new(
         desc: RxDescriptor,
-        updates: mpsc::Receiver<ReceiverMessage<RtpSample<S>>>,
         socket: UdpSocket,
         status: StatusApi,
         playout_buffer: PlayoutBufferWriter,
     ) -> Self {
         let rtp_buffer = init_buffer(desc.rtp_packet_size(), |_| 0u8);
-        let port_transmitters = init_buffer(desc.channels, |_| vec![].into());
 
         Self {
             desc,
-            updates,
             socket,
             rtp_buffer,
-            port_transmitters,
             min_buffer_usage: (0, 0),
             status,
             out_of_order_packets: 0,
@@ -836,65 +737,41 @@ where
         }
     }
 
-    async fn run(mut self) {
-        let mut interval = interval(Duration::from_millis(100));
+    async fn run(mut self, subsys: SubsystemHandle) {
+        let mut interval = interval(Duration::from_millis(200));
         loop {
             select! {
-                Some(update) = self.updates.recv() => if !self.apply_update(update).await {
-                    break;
-                },
+                _ = subsys.on_shutdown_requested() => break,
                 Ok((len, addr)) = self.socket.recv_from(&mut self.rtp_buffer) => self.process_packet(len, addr).await,
                 _ = interval.tick() => self.report_statistics().await,
                 else => break,
             }
         }
+
+        log::info!("Receiver {} stopped.", self.desc.id);
     }
 
     async fn process_packet(&mut self, len: usize, addr: SocketAddr) {
-        self.update_buffer_usage();
         if addr.ip() == self.desc.origin_ip {
+            self.update_buffer_usage();
             self.playout_buffer.insert(&self.rtp_buffer[0..len]);
         } else {
             log::warn!("Received packet from wrong sender: {addr}");
         }
     }
 
-    async fn apply_update(&mut self, msg: ReceiverMessage<RtpSample<S>>) -> bool {
-        match msg {
-            ReceiverMessage::ChannelMapping(mapping) => {
-                self.reset_buffer_usage();
-                self.port_transmitters = mapping;
-            }
-            ReceiverMessage::Stop => return false,
-        }
-        true
-    }
-
     fn update_buffer_usage(&mut self) {
-        let current_usage = (
-            self.port_transmitters
-                .iter()
-                .flatten()
-                .map(|s| s.max_capacity() - s.capacity())
-                .min()
-                .unwrap_or(0),
-            self.port_transmitters
-                .iter()
-                .flatten()
-                .map(|s| s.max_capacity())
-                .min()
-                .unwrap_or(0),
-        );
-
-        if current_usage.0 < self.min_buffer_usage.0 {
-            self.min_buffer_usage = current_usage;
-        }
+        // TODO
     }
 
     async fn report_statistics(&mut self) {
         let used = self.min_buffer_usage.0;
         let available = self.min_buffer_usage.1;
-        let percent = (used * 100) / available;
+        let percent = if available == 0 {
+            0
+        } else {
+            (used * 100) / available
+        };
         log::debug!(
             "Buffer usage of receiver {}: {}/{} ({}%)",
             self.desc.id,
@@ -932,21 +809,7 @@ where
     }
 
     fn reset_buffer_usage(&mut self) {
-        let expected_buffer_size = self.desc.samples_per_link_offset_buffer();
-        self.min_buffer_usage = (
-            self.port_transmitters
-                .iter()
-                .flatten()
-                .map(|s| s.max_capacity())
-                .min()
-                .unwrap_or(expected_buffer_size),
-            self.port_transmitters
-                .iter()
-                .flatten()
-                .map(|s| s.max_capacity())
-                .min()
-                .unwrap_or(expected_buffer_size),
-        );
+        // TODO
     }
 }
 

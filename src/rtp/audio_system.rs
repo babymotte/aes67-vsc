@@ -19,11 +19,7 @@ mod jack;
 
 pub(crate) use jack::JackAudioSystem;
 
-use crate::utils::{MediaClockTimestamp, PlayoutBufferReader, PlayoutBufferWriter};
-use tokio::sync::{mpsc, oneshot};
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct RtpSample<S>(pub MediaClockTimestamp, pub S);
+use crate::utils::{PlayoutBufferReader, PlayoutBufferWriter};
 
 pub(crate) trait AudioSystem {
     type SampleFormat;
@@ -42,18 +38,6 @@ pub(crate) trait AudioSystem {
         input_mapping: Box<[Option<(usize, PlayoutBufferWriter)>]>,
     );
 }
-
-pub(crate) type TransmitterBufferInitCallback<S> =
-    mpsc::Sender<(usize, oneshot::Sender<Box<[mpsc::Receiver<S>]>>)>;
-
-// pub(crate) type TransmitterBufferInitCallbackReceiver<S> =
-//     mpsc::Receiver<(usize, oneshot::Sender<Box<[mpsc::Receiver<S>]>>)>;
-
-pub(crate) type ReceiverBufferInitCallback<S> =
-    mpsc::Sender<(usize, oneshot::Sender<Box<[mpsc::Receiver<RtpSample<S>>]>>)>;
-
-// pub(crate) type ReceiverBufferInitCallbackReceiver<S> =
-//     mpsc::Receiver<(usize, oneshot::Sender<Box<[mpsc::Receiver<S>]>>)>;
 
 pub(crate) enum OutputEvent {
     BufferUnderrun(usize),
