@@ -31,6 +31,16 @@ pub(crate) trait AudioSystem {
     fn close(&mut self);
 
     fn sample_rate(&self) -> usize;
+
+    async fn active_outputs_changed(
+        &self,
+        output_mapping: Box<[Option<(usize, PlayoutBufferReader)>]>,
+    );
+
+    async fn active_inputs_changed(
+        &self,
+        input_mapping: Box<[Option<(usize, PlayoutBufferWriter)>]>,
+    );
 }
 
 pub(crate) type TransmitterBufferInitCallback<S> =
@@ -47,9 +57,4 @@ pub(crate) type ReceiverBufferInitCallback<S> =
 
 pub(crate) enum OutputEvent {
     BufferUnderrun(usize),
-}
-
-pub(crate) enum Message {
-    ActiveInputsChanged(Box<[Option<(usize, PlayoutBufferWriter)>]>),
-    ActiveOutputsChanged(Box<[Option<(usize, PlayoutBufferReader)>]>),
 }

@@ -16,8 +16,7 @@
  */
 
 use super::{
-    AudioSystem, Message, OutputEvent, ReceiverBufferInitCallback, RtpSample,
-    TransmitterBufferInitCallback,
+    AudioSystem, OutputEvent, ReceiverBufferInitCallback, RtpSample, TransmitterBufferInitCallback,
 };
 use crate::{
     error::RtpResult,
@@ -30,7 +29,7 @@ use jack::{
     contrib::ClosureProcessHandler, AudioIn, AudioOut, Client, ClientOptions, Control, Frames,
     Port, ProcessScope,
 };
-use std::{borrow::BorrowMut, thread};
+use std::thread;
 use tokio::sync::{
     mpsc::{self},
     oneshot,
@@ -39,9 +38,15 @@ use tokio_graceful_shutdown::SubsystemHandle;
 
 const CLIENT_NAME: &str = "AES67 VirtualSoundCard";
 
+pub(crate) enum Message {
+    ActiveInputsChanged(Box<[Option<(usize, PlayoutBufferWriter)>]>),
+    ActiveOutputsChanged(Box<[Option<(usize, PlayoutBufferReader)>]>),
+}
+
 pub(crate) struct JackAudioSystem {
     cancel: Option<oneshot::Sender<()>>,
     sample_rate: usize,
+    msg_tx: mpsc::Sender<Message>,
 }
 
 struct State {
@@ -55,8 +60,6 @@ struct State {
     msg_rx: mpsc::Receiver<Message>,
     active_inputs: Box<[Option<(usize, PlayoutBufferWriter)>]>,
     active_outputs: Box<[Option<(usize, PlayoutBufferReader)>]>,
-    // TODO make this a queue instead of just a single sample
-    pending_samples: Box<[Option<RtpSample<f32>>]>,
     link_offset: f32,
     jack_media_clock: Option<MediaClockTimestamp>,
 }
@@ -69,7 +72,6 @@ impl JackAudioSystem {
         receivers: usize,
         receiver_init: ReceiverBufferInitCallback<f32>,
         status: mpsc::Sender<OutputEvent>,
-        msg_rx: mpsc::Receiver<Message>,
         link_offset: f32,
     ) -> RtpResult<Self> {
         let active_inputs = init_buffer(transmitters, |_| None);
@@ -96,7 +98,8 @@ impl JackAudioSystem {
             out_ports.push(client.register_port(&format!("out{}", i + 1), AudioOut::default())?);
         }
 
-        let pending_samples = init_buffer(receivers, |_| None);
+        let (msg_tx, msg_rx) = mpsc::channel(transmitters + receivers);
+
         let _transmitters = None;
         let receivers = None;
         let jack_media_clock = None;
@@ -113,7 +116,6 @@ impl JackAudioSystem {
                 active_inputs,
                 active_outputs,
                 msg_rx,
-                pending_samples,
                 link_offset,
                 jack_media_clock,
             },
@@ -140,6 +142,7 @@ impl JackAudioSystem {
         Ok(Self {
             cancel: Some(st),
             sample_rate,
+            msg_tx,
         })
     }
 }
@@ -156,6 +159,26 @@ impl AudioSystem for JackAudioSystem {
 
     fn sample_rate(&self) -> usize {
         self.sample_rate
+    }
+
+    async fn active_outputs_changed(
+        &self,
+        output_mapping: Box<[Option<(usize, PlayoutBufferReader)>]>,
+    ) {
+        self.msg_tx
+            .send(Message::ActiveOutputsChanged(output_mapping))
+            .await
+            .ok();
+    }
+
+    async fn active_inputs_changed(
+        &self,
+        input_mapping: Box<[Option<(usize, PlayoutBufferWriter)>]>,
+    ) {
+        self.msg_tx
+            .send(Message::ActiveInputsChanged(input_mapping))
+            .await
+            .ok();
     }
 }
 

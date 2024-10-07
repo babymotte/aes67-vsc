@@ -16,7 +16,7 @@
  */
 
 use super::{
-    audio_system::{AudioSystem, JackAudioSystem, Message, OutputEvent, RtpSample},
+    audio_system::{AudioSystem, JackAudioSystem, OutputEvent, RtpSample},
     socket::{create_ipv4_rx_socket, create_ipv6_rx_socket},
     OutputMatrix,
 };
@@ -272,7 +272,6 @@ impl RtpRxApi {
         let (trans_init_tx, _trans_init_rx) = mpsc::channel(max_channels);
         let (recv_init_tx, recv_init_rx) = mpsc::channel(max_channels);
         let (output_event_tx, output_event_rx) = mpsc::channel(1000);
-        let (msg_tx, msg_rx) = mpsc::channel(1);
 
         let audio_system = JackAudioSystem::new(
             &subsys,
@@ -281,7 +280,6 @@ impl RtpRxApi {
             max_channels,
             recv_init_tx,
             output_event_tx,
-            msg_rx,
             link_offset,
         )
         .expect("audio system failed");
@@ -299,7 +297,6 @@ impl RtpRxApi {
                 recv_init_rx,
                 audio_system,
                 local_ip,
-                msg_tx,
                 output_event_rx,
                 sample_rate,
             );
@@ -351,7 +348,7 @@ where
         usize,
         oneshot::Sender<Box<[mpsc::Receiver<RtpSample<SampleFormat>>]>>,
     )>,
-    _audio_system: AS,
+    audio_system: AS,
     receiver_ids: HashMap<String, ReceiverId>,
     active_receivers: Box<
         [Option<(
@@ -363,7 +360,6 @@ where
     port_txs: Box<[Option<mpsc::Sender<RtpSample<SampleFormat>>>]>,
     local_ip: Option<IpAddr>,
     active_ports: Box<[Option<(usize, PlayoutBufferReader)>]>,
-    msg_tx: mpsc::Sender<Message>,
     output_event_rx: mpsc::Receiver<OutputEvent>,
     sample_rate: usize,
 }
@@ -434,7 +430,6 @@ where
         recv_init_rx: mpsc::Receiver<(usize, oneshot::Sender<Box<[mpsc::Receiver<RtpSample<S>>]>>)>,
         audio_system: AS,
         local_ip: Option<IpAddr>,
-        msg_tx: mpsc::Sender<Message>,
         output_event_rx: mpsc::Receiver<OutputEvent>,
         sample_rate: usize,
     ) -> Self {
@@ -452,14 +447,13 @@ where
             link_offset,
             status,
             recv_init_rx,
-            _audio_system: audio_system,
+            audio_system,
             receiver_ids,
             active_receivers,
             matrix,
             port_txs,
             local_ip,
             active_ports,
-            msg_tx,
             output_event_rx,
             sample_rate,
         }
@@ -554,7 +548,7 @@ where
 
         let (pob_writer, pob_reader) = playout_buffer(desc.clone());
 
-        self.activate_ports(changed_ports, pob_reader).await?;
+        self.activate_ports(changed_ports, pob_reader).await;
 
         let (updates_tx, updates) = mpsc::channel(1);
         let mapping = self.get_channel_mapping(&desc);
@@ -620,7 +614,7 @@ where
 
             let changed_ports = self.matrix.auto_unroute(receiver_id);
 
-            self.deactivate_ports(changed_ports).await?;
+            self.deactivate_ports(changed_ports).await;
 
             self.receiver_ids.remove(&desc.session_id());
 
@@ -659,7 +653,7 @@ where
         &mut self,
         changed_ports: Vec<usize>,
         playout_buffer: PlayoutBufferReader,
-    ) -> RxResult<()> {
+    ) {
         for port in changed_ports {
             self.active_ports[port] = self
                 .matrix
@@ -667,22 +661,18 @@ where
                 .get(&port)
                 .map(|ch| (ch.0.channel_nr, playout_buffer.clone()));
         }
-        self.msg_tx
-            .send(Message::ActiveOutputsChanged(self.active_ports.clone()))
-            .await
-            .map_err(|e| RxError::Other(format!("could not update active ports: {e}")))?;
-        Ok(())
+        self.audio_system
+            .active_outputs_changed(self.active_ports.clone())
+            .await;
     }
 
-    async fn deactivate_ports(&mut self, changed_ports: Vec<usize>) -> RxResult<()> {
+    async fn deactivate_ports(&mut self, changed_ports: Vec<usize>) {
         for port in changed_ports {
             self.active_ports[port] = None;
         }
-        self.msg_tx
-            .send(Message::ActiveOutputsChanged(self.active_ports.clone()))
-            .await
-            .map_err(|e| RxError::Other(format!("could not update active ports: {e}")))?;
-        Ok(())
+        self.audio_system
+            .active_outputs_changed(self.active_ports.clone())
+            .await;
     }
 }
 
