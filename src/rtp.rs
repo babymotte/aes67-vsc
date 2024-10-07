@@ -59,9 +59,6 @@ pub struct InputMatrix {
 impl OutputMatrix {
     pub fn default(channels: usize) -> OutputMatrix {
         let mapping = HashMap::new();
-        // for i in 0..outputs {
-        //     map.insert(i, Channel::new(i / 2, i % 2));
-        // }
         OutputMatrix { channels, mapping }
     }
 
@@ -115,9 +112,6 @@ impl OutputMatrix {
 impl InputMatrix {
     pub fn default(channels: usize) -> InputMatrix {
         let mapping = HashMap::new();
-        // for i in 0..inputs {
-        //     map.insert(Channel::new(i / 2, i % 2), i);
-        // }
         InputMatrix { channels, mapping }
     }
 }

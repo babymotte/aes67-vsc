@@ -183,15 +183,7 @@ async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
     cleanup_discovery(&subsys, wb.clone(), wb_root_key.to_owned());
 
     ui(
-        &subsys,
-        rtp_tx,
-        rtp_rx,
-        sap,
-        port,
-        wb.clone(),
-        wb_cfg,
-        args.ui,
-        hostname,
+        &subsys, rtp_tx, rtp_rx, sap, port, wb_cfg, args.ui, hostname,
     )
     .await?;
 

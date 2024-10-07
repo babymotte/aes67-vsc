@@ -1,3 +1,7 @@
+use crate::utils::{wrap_u128, MediaClockTimestamp};
+/**
+ * This is in large parts copied with some modifications from https://crates.io/crates/statime-linux
+ */
 use fixed::traits::LossyInto;
 use pnet::datalink::NetworkInterface;
 use rand::{rngs::StdRng, SeedableRng};
@@ -38,8 +42,6 @@ use tokio::{
     time::Sleep,
 };
 use worterbuch_client::{topic, Worterbuch};
-
-use crate::utils::{wrap_u128, MediaClockTimestamp};
 
 trait PortClock:
     Clock<Error = <LinuxClock as Clock>::Error> + PortTimestampToTime + Send + Sync

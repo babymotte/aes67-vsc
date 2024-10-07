@@ -66,7 +66,6 @@ struct UiActor {
     rtp_rx: RtpRxApi,
     sap: SapApi,
     ui_commands: mpsc::Receiver<UiFunction>,
-    wb: Worterbuch,
 }
 
 impl Actor for UiActor {
@@ -115,7 +114,6 @@ pub async fn ui(
     rtp_rx: RtpRxApi,
     sap: SapApi,
     port: u16,
-    wb: Worterbuch,
     wb_cfg: Config,
     open_web_ui: bool,
     namespace: String,
@@ -175,7 +173,6 @@ pub async fn ui(
             sap,
             subsys: s,
             ui_commands,
-            wb,
         };
 
         actor
