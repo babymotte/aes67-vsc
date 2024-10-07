@@ -20,6 +20,7 @@ use super::{
 };
 use crate::{
     error::RtpResult,
+    ptp::statime_linux::SystemClock,
     utils::{
         frames_per_link_offset_buffer, init_buffer, read_f32_sample, set_realtime_priority,
         MediaClockTimestamp, PlayoutBufferReader, PlayoutBufferWriter,
@@ -62,6 +63,7 @@ struct State {
     active_outputs: Box<[Option<(usize, PlayoutBufferReader)>]>,
     link_offset: f32,
     jack_media_clock: Option<MediaClockTimestamp>,
+    clock: SystemClock,
 }
 
 impl JackAudioSystem {
@@ -73,6 +75,7 @@ impl JackAudioSystem {
         receiver_init: ReceiverBufferInitCallback<f32>,
         status: mpsc::Sender<OutputEvent>,
         link_offset: f32,
+        clock: SystemClock,
     ) -> RtpResult<Self> {
         let active_inputs = init_buffer(transmitters, |_| None);
         let active_outputs = init_buffer(receivers, |_| None);
@@ -118,6 +121,7 @@ impl JackAudioSystem {
                 msg_rx,
                 link_offset,
                 jack_media_clock,
+                clock,
             },
             process,
             init_buffers,
@@ -216,7 +220,9 @@ fn init_buffers(state: &mut State, _: &Client, len: Frames) -> Control {
 }
 
 fn process(state: &mut State, client: &Client, ps: &ProcessScope) -> Control {
-    let media_clock = MediaClockTimestamp::now(client.sample_rate(), state.link_offset, 0);
+    let media_clock = state
+        .clock
+        .media_clock(client.sample_rate(), state.link_offset);
     let mut jack_media_clock = if let Some(it) = state.jack_media_clock {
         it
     } else {
@@ -229,7 +235,7 @@ fn process(state: &mut State, client: &Client, ps: &ProcessScope) -> Control {
 
     // severely out of sync, this will cause an audible jump
     if drift.abs() >= client.buffer_size() as i64 {
-        log::warn!("JACK media clock is {drift} samples off, resetting it to system media clock");
+        log::debug!("JACK media clock is {drift} samples off, resetting it to system media clock");
         jack_media_clock = media_clock;
     } else
     // if jack clock is slightly off, bring them back together again

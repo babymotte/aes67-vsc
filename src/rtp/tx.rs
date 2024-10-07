@@ -18,6 +18,7 @@
 use crate::{
     actor::{Actor, ActorApi},
     error::{RxError, TxError},
+    ptp::statime_linux::SystemClock,
     TransmitterId,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -38,7 +39,7 @@ impl ActorApi for RtpTxApi {
 }
 
 impl RtpTxApi {
-    pub fn new(subsys: &SubsystemHandle) -> Result<Self, RxError> {
+    pub fn new(subsys: &SubsystemHandle, clock: SystemClock) -> Result<Self, RxError> {
         let (channel, commands) = mpsc::channel(1);
 
         subsys.start(SubsystemBuilder::new("rtp/tx", |s| async move {

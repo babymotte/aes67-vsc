@@ -23,6 +23,7 @@ use super::{
 use crate::{
     actor::{respond, Actor, ActorApi},
     error::{RxError, RxResult},
+    ptp::statime_linux::SystemClock,
     status::{Receiver, Status, StatusApi},
     utils::{self, init_buffer, playout_buffer, PlayoutBufferReader, PlayoutBufferWriter},
     ReceiverId,
@@ -36,7 +37,7 @@ use sdp::{
 };
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -262,10 +263,11 @@ impl ActorApi for RtpRxApi {
 impl RtpRxApi {
     pub fn new(
         subsys: &SubsystemHandle,
+        clock: SystemClock,
         max_channels: usize,
         link_offset: f32,
         status: StatusApi,
-        local_ip: Option<IpAddr>,
+        local_ip: IpAddr,
     ) -> Result<Self, RxError> {
         let (channel, commands) = mpsc::channel(1);
 
@@ -281,6 +283,7 @@ impl RtpRxApi {
             recv_init_tx,
             output_event_tx,
             link_offset,
+            clock,
         )
         .expect("audio system failed");
 
@@ -358,7 +361,7 @@ where
     >,
     matrix: OutputMatrix,
     port_txs: Box<[Option<mpsc::Sender<RtpSample<SampleFormat>>>]>,
-    local_ip: Option<IpAddr>,
+    local_ip: IpAddr,
     active_ports: Box<[Option<(usize, PlayoutBufferReader)>]>,
     output_event_rx: mpsc::Receiver<OutputEvent>,
     sample_rate: usize,
@@ -429,7 +432,7 @@ where
         status: StatusApi,
         recv_init_rx: mpsc::Receiver<(usize, oneshot::Sender<Box<[mpsc::Receiver<RtpSample<S>>]>>)>,
         audio_system: AS,
-        local_ip: Option<IpAddr>,
+        local_ip: IpAddr,
         output_event_rx: mpsc::Receiver<OutputEvent>,
         sample_rate: usize,
     ) -> Self {
@@ -678,7 +681,7 @@ where
 
 async fn create_rx_socket(
     sdp: &SessionDescription,
-    local_ip: Option<IpAddr>,
+    local_ip: IpAddr,
 ) -> Result<UdpSocket, RxError> {
     let global_c = sdp.connection_information.as_ref();
 
@@ -768,22 +771,16 @@ async fn create_rx_socket(
     };
 
     let socket = match (ip_addr, local_ip) {
-        (IpAddr::V4(ipv4_addr), Some(IpAddr::V4(local_ip))) => {
+        (IpAddr::V4(ipv4_addr), IpAddr::V4(local_ip)) => {
             create_ipv4_rx_socket(ipv4_addr, local_ip, port)?
         }
-        (IpAddr::V6(ipv6_addr), Some(IpAddr::V6(local_ip))) => {
+        (IpAddr::V6(ipv6_addr), IpAddr::V6(local_ip)) => {
             create_ipv6_rx_socket(ipv6_addr, local_ip, port)?
         }
-        (IpAddr::V4(ipv4_addr), None) => {
-            create_ipv4_rx_socket(ipv4_addr, Ipv4Addr::UNSPECIFIED, port)?
-        }
-        (IpAddr::V6(ipv6_addr), None) => {
-            create_ipv6_rx_socket(ipv6_addr, Ipv6Addr::UNSPECIFIED, port)?
-        }
-        (IpAddr::V4(_), Some(IpAddr::V6(_))) => Err(RxError::Other(
+        (IpAddr::V4(_), IpAddr::V6(_)) => Err(RxError::Other(
             "Cannot receive IPv4 stream when bound to local IPv6 address".to_owned(),
         ))?,
-        (IpAddr::V6(_), Some(IpAddr::V4(_))) => Err(RxError::Other(
+        (IpAddr::V6(_), IpAddr::V4(_)) => Err(RxError::Other(
             "Cannot receive IPv6 stream when bound to local IPv4 address".to_owned(),
         ))?,
     };

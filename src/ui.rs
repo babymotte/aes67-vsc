@@ -18,7 +18,6 @@
 use crate::actor::{respond, Actor, ActorApi};
 use aes67_vsc::{
     error::{RxError, SapError},
-    ptp::PtpApi,
     rtp::{RtpRxApi, RtpTxApi},
     sap::SapApi,
     utils::open_browser,
@@ -65,7 +64,6 @@ struct UiActor {
     subsys: SubsystemHandle,
     rtp_tx: RtpTxApi,
     rtp_rx: RtpRxApi,
-    ptp: PtpApi,
     sap: SapApi,
     ui_commands: mpsc::Receiver<UiFunction>,
     wb: Worterbuch,
@@ -115,7 +113,6 @@ pub async fn ui(
     subsys: &SubsystemHandle,
     rtp_tx: RtpTxApi,
     rtp_rx: RtpRxApi,
-    ptp: PtpApi,
     sap: SapApi,
     port: u16,
     wb: Worterbuch,
@@ -173,7 +170,6 @@ pub async fn ui(
         let cancel_token = s.create_cancellation_token();
 
         let mut actor = UiActor {
-            ptp,
             rtp_rx,
             rtp_tx,
             sap,

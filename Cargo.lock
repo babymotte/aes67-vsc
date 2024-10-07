@@ -25,13 +25,17 @@ dependencies = [
  "clap",
  "clap-verbosity-flag",
  "dotenv",
+ "fixed",
+ "hex",
  "hostname",
  "jack",
  "lazy_static",
  "libc",
  "log",
  "miette",
+ "pin-project-lite",
  "pnet",
+ "rand",
  "regex",
  "rtp-rs",
  "sap-rs",
@@ -44,12 +48,13 @@ dependencies = [
  "thiserror",
  "thread-priority",
  "tikv-jemallocator",
+ "timestamped-socket",
  "tokio",
  "tokio-graceful-shutdown",
  "tokio-util",
  "tower 0.5.1",
  "tower-http",
- "tracing-log 0.2.0",
+ "tracing-log",
  "tracing-subscriber",
  "uuid",
  "worterbuch-client",
@@ -146,6 +151,9 @@ name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "async-stream"
@@ -1528,9 +1536,9 @@ dependencies = [
 
 [[package]]
 name = "statime"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54828ec70f9bf2358f17c9e8562d68f7a7de05f3c8873bc618dcc76de56646b6"
+checksum = "d18fc78f114860bd801618e3cb2632363a8f0ca240a7ea1f3c7e8353e6c82b64"
 dependencies = [
  "arrayvec",
  "az",
@@ -1543,9 +1551,9 @@ dependencies = [
 
 [[package]]
 name = "statime-linux"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5b3e52bb81633aebbabb6819605889e33ccf7cfd453056de1c447aa02d15fd7"
+checksum = "bc6829f4955cded79b9da722ef4a23c3a6862abb599478e85daf32ba2aa95788"
 dependencies = [
  "arrayvec",
  "clap",
@@ -1562,7 +1570,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "tracing-log 0.1.4",
+ "tracing-log",
  "tracing-subscriber",
 ]
 
@@ -1944,17 +1952,6 @@ dependencies = [
 
 [[package]]
 name = "tracing-log"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f751112709b4e791d8ce53e32c4ed2d353565a795ce84da2285393f41557bdf2"
-dependencies = [
- "log",
- "once_cell",
- "tracing-core",
-]
-
-[[package]]
-name = "tracing-log"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
@@ -1979,7 +1976,7 @@ dependencies = [
  "thread_local",
  "tracing",
  "tracing-core",
- "tracing-log 0.2.0",
+ "tracing-log",
 ]
 
 [[package]]

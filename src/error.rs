@@ -18,7 +18,6 @@
 use std::io;
 
 use crate::{
-    ptp::PtpFunction,
     rtp::{RxConfig, RxFunction, RxThreadFunction, TxFunction},
     sap::SapFunction,
     status::Status,
@@ -118,9 +117,11 @@ pub enum PtpError {
     #[error("io error: {0}")]
     IoError(#[from] io::Error),
     #[error("channel error: {0}")]
-    SendError(#[from] SendError<PtpFunction>),
-    #[error("channel error: {0}")]
     ReceiveError(#[from] RecvError),
+    #[error("clock error: {0}")]
+    ClockError(&'static str),
+    #[error("unknown os error")]
+    Unknown,
 }
 
 pub type PtpResult<T> = Result<T, PtpError>;

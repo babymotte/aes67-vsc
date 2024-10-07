@@ -16,13 +16,10 @@
  */
 
 use super::frames_per_link_offset_buffer;
-use libc::{clock_gettime, timespec, CLOCK_REALTIME};
 use std::{
     cmp::Ordering,
-    fmt::{Debug, Display},
+    fmt::Display,
     ops::{Add, Sub},
-    time::Duration,
-    u32,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -39,14 +36,6 @@ impl Display for MediaClockTimestamp {
 }
 
 impl MediaClockTimestamp {
-    pub fn now(sample_rate: usize, link_offset: f32, rtp_offset: u32) -> Self {
-        Self {
-            timestamp: wrapped_media_time(sample_rate, rtp_offset),
-            sample_rate,
-            link_offset,
-        }
-    }
-
     pub fn new(timestamp: u32, sample_rate: usize, link_offset: f32) -> Self {
         Self {
             timestamp,
@@ -172,100 +161,32 @@ impl Ord for MediaClockTimestamp {
     }
 }
 
-fn wrap_u128(value: u128) -> u32 {
+pub fn wrap_u128(value: u128) -> u32 {
     (value % (u32::MAX as u128 + 1)) as u32
 }
 
-fn wrap_u64(value: u64) -> u32 {
+pub fn wrap_u64(value: u64) -> u32 {
     (value % (u32::MAX as u64 + 1)) as u32
 }
 
-pub fn wrapped_media_time(sampling_rate: usize, rtp_offset: u32) -> u32 {
-    wrap_u128(media_time(sampling_rate, rtp_offset))
-}
-
-fn media_time(sampling_rate: usize, rtp_offset: u32) -> u128 {
-    let nanos = time_nanos();
-    rtp_offset as u128 + ((nanos * sampling_rate as u128) / Duration::from_secs(1).as_nanos())
-}
-
-fn time_nanos() -> u128 {
-    let mut ts: timespec = timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    unsafe {
-        clock_gettime(CLOCK_REALTIME, &mut ts);
-    }
-    if ts.tv_sec < 0 {
-        panic!("your system clock is seriously messed up");
-    }
-    Duration::from_secs(ts.tv_sec as u64).as_nanos() + ts.tv_nsec as u128
-}
+// fn time_nanos() -> u128 {
+//     let mut ts: timespec = timespec {
+//         tv_sec: 0,
+//         tv_nsec: 0,
+//     };
+//     unsafe {
+//         clock_gettime(CLOCK_REALTIME, &mut ts);
+//     }
+//     if ts.tv_sec < 0 {
+//         panic!("your system clock is seriously messed up");
+//     }
+//     Duration::from_secs(ts.tv_sec as u64).as_nanos() + ts.tv_nsec as u128
+// }
 
 #[cfg(test)]
 mod test {
-    use crate::utils::frames_per_packet;
-
     use super::*;
-    use std::{thread, time::Duration};
-    use tokio::time::sleep;
-
-    #[ignore = "tests the runtime behavior of the current hardware, no use running this in CI build"]
-    #[tokio::test]
-    async fn clock_isnt_lying() {
-        let start = time_nanos();
-        sleep(Duration::from_secs(1)).await;
-        assert!(time_nanos() - start > 1_000_000_000);
-    }
-
-    #[ignore = "tests the runtime behavior of the current hardware, no use running this in CI build"]
-    #[test]
-    fn clock_has_millisecond_precision() {
-        let mut last_modulo = 0;
-        let mut failed = 0;
-        for _ in 0..10 {
-            thread::sleep(Duration::from_millis(1));
-            let modulo = time_nanos() % 100_000_000;
-            if modulo == last_modulo {
-                failed += 1;
-            }
-            last_modulo = modulo;
-        }
-        assert!(failed < 6);
-    }
-
-    #[ignore = "tests the runtime behavior of the current hardware, no use running this in CI build"]
-    #[test]
-    fn clock_has_microsecond_precision() {
-        let mut last_modulo = 0;
-        let mut failed = 0;
-        for _ in 0..10 {
-            thread::sleep(Duration::from_millis(1));
-            let modulo = time_nanos() % 100_000;
-            if modulo == last_modulo {
-                failed += 1;
-            }
-            last_modulo = modulo;
-        }
-        assert!(failed < 6);
-    }
-
-    #[ignore = "tests the runtime behavior of the current hardware, no use running this in CI build"]
-    #[test]
-    fn clock_has_nanosecond_precision() {
-        let mut last_modulo = 0;
-        let mut failed = 0;
-        for _ in 0..10 {
-            thread::sleep(Duration::from_millis(1));
-            let modulo = time_nanos() % 10;
-            if modulo == last_modulo {
-                failed += 1;
-            }
-            last_modulo = modulo;
-        }
-        assert!(failed < 6);
-    }
+    use crate::utils::frames_per_packet;
 
     #[test]
     fn media_clock_timestamp_addition_works() {

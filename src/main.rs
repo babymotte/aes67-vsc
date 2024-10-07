@@ -20,15 +20,16 @@ mod ui;
 
 use aes67_vsc::{
     discovery_cleanup::cleanup_discovery,
-    ptp::PtpApi,
+    ptp::ptp,
     rtp::{RtpRxApi, RtpTxApi},
     sap::SapApi,
     status::StatusApi,
     utils::set_realtime_priority,
 };
 use clap::Parser;
-use miette::{IntoDiagnostic, Result};
-use std::{io, net::IpAddr, time::Duration};
+use miette::{miette, IntoDiagnostic, Result};
+use pnet::datalink::{self, NetworkInterface};
+use std::{io, time::Duration};
 #[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
 use tikv_jemallocator::Jemalloc;
 use tokio::{select, sync::oneshot};
@@ -62,7 +63,7 @@ struct Args {
     link_offset: f32,
     /// The local IP address to bind to
     #[arg()]
-    ip: Option<IpAddr>,
+    iface: Option<String>,
     /// Open the web UI on start
     #[arg(long)]
     ui: bool,
@@ -93,6 +94,22 @@ async fn main() -> Result<()> {
 }
 
 async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
+    let iface = if let Some(it) = get_network_iface(args.iface.as_deref()) {
+        it
+    } else {
+        return Err(miette!("network interface not found"));
+    };
+
+    let ip = if let Some(it) = iface.ips.iter().filter(|it| !it.ip().is_loopback()).next() {
+        it.to_owned()
+    } else {
+        return Err(miette!("network interface has no IP"));
+    };
+
+    if iface.mac.is_none() {
+        return Err(miette!("network interface has no MAC address"));
+    }
+
     let port = args.port;
     let link_offset = args.link_offset;
 
@@ -139,9 +156,12 @@ async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
     )
     .await
     .into_diagnostic()?;
-    wb.set(topic!(wb_namespace_key, "config", "network", "ip"), args.ip)
-        .await
-        .into_diagnostic()?;
+    wb.set(
+        topic!(wb_namespace_key, "config", "network", "ip"),
+        ip.ip().to_string(),
+    )
+    .await
+    .into_diagnostic()?;
     wb.set(
         topic!(wb_namespace_key, "config", "network", "port"),
         args.port,
@@ -149,13 +169,20 @@ async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
     .await
     .into_diagnostic()?;
 
+    let clock = ptp(iface, ip.ip()).await;
     let status = StatusApi::new(&subsys, wb.clone(), topic!(wb_namespace_key, "status"))
         .into_diagnostic()?;
-    let rtp_tx = RtpTxApi::new(&subsys).into_diagnostic()?;
-    let rtp_rx = RtpRxApi::new(&subsys, args.inputs, link_offset, status.clone(), args.ip)
-        .into_diagnostic()?;
+    let rtp_tx = RtpTxApi::new(&subsys, clock.clone()).into_diagnostic()?;
+    let rtp_rx = RtpRxApi::new(
+        &subsys,
+        clock.clone(),
+        args.inputs,
+        link_offset,
+        status.clone(),
+        ip.ip(),
+    )
+    .into_diagnostic()?;
     let sap = SapApi::new(&subsys, wb.clone(), wb_root_key.to_owned()).into_diagnostic()?;
-    let ptp = PtpApi::new(&subsys).into_diagnostic()?;
 
     cleanup_discovery(&subsys, wb.clone(), wb_root_key.to_owned());
 
@@ -163,7 +190,6 @@ async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
         &subsys,
         rtp_tx,
         rtp_rx,
-        ptp,
         sap,
         port,
         wb.clone(),
@@ -179,4 +205,30 @@ async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn get_network_iface(name: Option<&str>) -> Option<NetworkInterface> {
+    match name {
+        Some(name) => {
+            for iface in datalink::interfaces() {
+                if iface.name == name {
+                    return Some(iface);
+                }
+            }
+            None
+        }
+        None => {
+            for iface in datalink::interfaces() {
+                if iface.is_up()
+                    && iface.is_running()
+                    && !iface.is_loopback()
+                    && !iface.ips.is_empty()
+                    && iface.mac.is_some()
+                {
+                    return Some(iface);
+                }
+            }
+            None
+        }
+    }
 }
