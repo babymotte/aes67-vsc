@@ -16,6 +16,7 @@
  */
 
 pub(crate) mod actor;
+pub mod audio_system;
 pub mod discovery_cleanup;
 pub mod error;
 pub mod ptp;

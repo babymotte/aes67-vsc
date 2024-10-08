@@ -16,12 +16,12 @@
  */
 
 use super::{
-    audio_system::{AudioSystem, JackAudioSystem, OutputEvent},
     socket::{create_ipv4_rx_socket, create_ipv6_rx_socket},
     OutputMatrix,
 };
 use crate::{
     actor::{respond, Actor, ActorApi},
+    audio_system::{jack::JackAudioSystem, AudioSystem, OutputEvent},
     error::{RxError, RxResult},
     ptp::statime_linux::SharedOverlayClock,
     status::{Receiver, Status, StatusApi},
@@ -42,7 +42,7 @@ use std::{
 };
 use tokio::{
     net::UdpSocket,
-    select, spawn,
+    select,
     sync::{
         mpsc::{self},
         oneshot,

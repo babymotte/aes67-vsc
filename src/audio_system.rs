@@ -15,9 +15,7 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-mod jack;
-
-pub(crate) use jack::JackAudioSystem;
+pub mod jack;
 
 use crate::utils::{PlayoutBufferReader, PlayoutBufferWriter};
 
