@@ -19,7 +19,7 @@ use crate::error::RxError;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-pub(crate) fn create_ipv4_rx_socket(
+pub fn create_ipv4_rx_socket(
     ip_addr: Ipv4Addr,
     local_ip: Ipv4Addr,
     port: u16,
@@ -53,7 +53,7 @@ pub(crate) fn create_ipv4_rx_socket(
     Ok(socket)
 }
 
-pub(crate) fn create_ipv6_rx_socket(
+pub fn create_ipv6_rx_socket(
     ip_addr: Ipv6Addr,
     local_ip: Ipv6Addr,
     port: u16,

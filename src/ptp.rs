@@ -15,7 +15,7 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-pub(crate) mod statime_linux;
+pub mod statime_linux;
 
 use pnet::datalink::NetworkInterface;
 use statime_linux::{statime_linux, SharedOverlayClock};

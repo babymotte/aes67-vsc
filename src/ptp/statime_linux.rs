@@ -115,18 +115,18 @@ impl SharedOverlayClock {
         self.0.now().nanos().saturating_round().lossy_into()
     }
 
-    pub fn media_clock(&self, sample_rate: usize, link_offset: f32) -> MediaClockTimestamp {
+    pub fn media_clock(&self, sample_rate: usize) -> MediaClockTimestamp {
         let timestamp = self.wrapped_media_clock(sample_rate);
-        MediaClockTimestamp::new(timestamp, sample_rate, link_offset)
+        MediaClockTimestamp::new(timestamp, sample_rate)
     }
 
-    pub fn wrapped_media_clock(&self, sampling_rate: usize) -> u32 {
-        wrap_u128(self.raw_media_clock(sampling_rate))
+    pub fn wrapped_media_clock(&self, sample_rate: usize) -> u32 {
+        wrap_u128(self.raw_media_clock(sample_rate))
     }
 
-    fn raw_media_clock(&self, sampling_rate: usize) -> u128 {
+    fn raw_media_clock(&self, sample_rate: usize) -> u128 {
         let nanos = self.now_nanos();
-        (nanos * sampling_rate as u128) / std::time::Duration::from_secs(1).as_nanos()
+        (nanos * sample_rate as u128) / std::time::Duration::from_secs(1).as_nanos()
     }
 }
 

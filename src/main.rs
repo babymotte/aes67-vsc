@@ -20,11 +20,10 @@ mod ui;
 
 use aes67_vsc::{
     discovery_cleanup::cleanup_discovery,
-    ptp::ptp,
     rtp::{RtpRxApi, RtpTxApi},
     sap::SapApi,
     status::StatusApi,
-    utils::set_realtime_priority,
+    utils::{cretae_shared_memory_buffers, print_ifaces, set_realtime_priority},
 };
 use clap::Parser;
 use miette::{miette, IntoDiagnostic, Result};
@@ -55,7 +54,10 @@ struct Args {
     /// Number of output channels
     #[arg(short, long, default_value = "32")]
     outputs: usize,
-    /// Max link offset it ms
+    /// Sample rate
+    #[arg(short, long, default_value = "48000")]
+    sample_rate: usize,
+    /// Link offset it ms
     #[arg(short, long, default_value = "20")]
     link_offset: f32,
     /// The local IP address to bind to
@@ -71,6 +73,13 @@ async fn main() -> Result<()> {
     dotenv::dotenv().ok();
 
     let args: Args = Args::parse();
+
+    let iface_name = if let Some(it) = args.iface.as_deref() {
+        it
+    } else {
+        print_ifaces();
+        return Err(miette!("network interface not specified"));
+    };
 
     tracing_subscriber::fmt()
         .with_writer(io::stderr)
@@ -165,19 +174,16 @@ async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
     .await
     .into_diagnostic()?;
 
-    let clock = ptp(iface, ip.ip(), wb.clone(), wb_namespace_key.clone()).await;
+    let (input_buffer, output_buffer) =
+        cretae_shared_memory_buffers(args.inputs, args.outputs, args.sample_rate, link_offset)
+            .into_diagnostic()?;
+
+    // let clock = ptp(iface, ip.ip(), wb.clone(), wb_namespace_key.clone()).await;
     let status = StatusApi::new(&subsys, wb.clone(), topic!(wb_namespace_key, "status"))
         .into_diagnostic()?;
-    let rtp_tx = RtpTxApi::new(&subsys, clock.clone()).into_diagnostic()?;
-    let rtp_rx = RtpRxApi::new(
-        &subsys,
-        clock.clone(),
-        args.inputs,
-        link_offset,
-        status.clone(),
-        ip.ip(),
-    )
-    .into_diagnostic()?;
+    let rtp_tx = RtpTxApi::new(&subsys).into_diagnostic()?;
+    let rtp_rx =
+        RtpRxApi::new(&subsys, status.clone(), ip.ip(), output_buffer).into_diagnostic()?;
     let sap = SapApi::new(&subsys, wb.clone(), wb_root_key.to_owned()).into_diagnostic()?;
 
     cleanup_discovery(&subsys, wb.clone(), wb_root_key.to_owned());

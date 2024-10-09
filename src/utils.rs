@@ -18,8 +18,9 @@
 mod buffers;
 mod time;
 
-pub(crate) use buffers::*;
-pub(crate) use time::*;
+pub use buffers::*;
+use pnet::datalink;
+pub use time::*;
 
 use std::{net::IpAddr, time::Duration};
 use thread_priority::{
@@ -27,6 +28,8 @@ use thread_priority::{
     ThreadSchedulePolicy,
 };
 use tokio::{process::Command, spawn};
+
+use crate::SampleFormat;
 
 pub fn rtp_header_len() -> usize {
     12
@@ -48,76 +51,76 @@ pub fn bytes_per_sample(bit_depth: usize) -> usize {
     bit_depth / 8
 }
 
-pub fn bytes_per_frame(channels: usize, bit_depth: usize) -> usize {
-    channels * bytes_per_sample(bit_depth)
+pub fn bytes_per_frame(channels: usize, sample_format: SampleFormat) -> usize {
+    channels * sample_format.bytes_per_sample()
 }
 
-pub fn frames_per_packet(sampling_rate: usize, packet_time: f32) -> usize {
-    f32::ceil((sampling_rate as f32 * packet_time) / 1000.0) as usize
+pub fn frames_per_packet(sample_rate: usize, packet_time: f32) -> usize {
+    f32::ceil((sample_rate as f32 * packet_time) / 1000.0) as usize
 }
 
-pub fn samples_per_packet(channels: usize, sampling_rate: usize, packet_time: f32) -> usize {
-    channels * frames_per_packet(sampling_rate, packet_time)
+pub fn samples_per_packet(channels: usize, sample_rate: usize, packet_time: f32) -> usize {
+    channels * frames_per_packet(sample_rate, packet_time)
 }
 
 pub fn packets_in_link_offset(link_offset: f32, packet_time: f32) -> usize {
     f32::ceil(link_offset / packet_time) as usize
 }
 
-pub fn frames_per_link_offset_buffer(link_offset: f32, sampling_rate: usize) -> usize {
-    f32::ceil((sampling_rate as f32 * link_offset) / Duration::from_secs(1).as_millis() as f32)
+pub fn frames_per_link_offset_buffer(link_offset: f32, sample_rate: usize) -> usize {
+    f32::ceil((sample_rate as f32 * link_offset) / Duration::from_secs(1).as_millis() as f32)
         as usize
 }
 
 pub fn link_offset_buffer_size(
     channels: usize,
     link_offset: f32,
-    sampling_rate: usize,
-    bit_depth: usize,
+    sample_rate: usize,
+    sample_format: SampleFormat,
 ) -> usize {
-    samples_per_link_offset_buffer(channels, link_offset, sampling_rate)
-        * bytes_per_sample(bit_depth)
+    samples_per_link_offset_buffer(channels, link_offset, sample_rate)
+        * sample_format.bytes_per_sample()
 }
 
 pub fn rtp_payload_size(
-    sampling_rate: usize,
+    sample_rate: usize,
     packet_time: f32,
     channels: usize,
-    bit_depth: usize,
+    sample_format: SampleFormat,
 ) -> usize {
-    frames_per_packet(sampling_rate, packet_time) * bytes_per_frame(channels, bit_depth)
+    frames_per_packet(sample_rate, packet_time) * bytes_per_frame(channels, sample_format)
 }
 
 pub fn rtp_packet_size(
-    sampling_rate: usize,
+    sample_rate: usize,
     packet_time: f32,
     channels: usize,
-    bit_depth: usize,
+    sample_format: SampleFormat,
 ) -> usize {
-    rtp_header_len() + rtp_payload_size(sampling_rate, packet_time, channels, bit_depth)
+    rtp_header_len() + rtp_payload_size(sample_rate, packet_time, channels, sample_format)
 }
 
 pub fn samples_per_link_offset_buffer(
     channels: usize,
     link_offset: f32,
-    sampling_rate: usize,
+    sample_rate: usize,
 ) -> usize {
-    channels * frames_per_link_offset_buffer(link_offset, sampling_rate)
+    channels * frames_per_link_offset_buffer(link_offset, sample_rate)
 }
 
 pub fn rtp_buffer_size(
     link_offset: f32,
     packet_time: f32,
-    sampling_rate: usize,
+    sample_rate: usize,
     channels: usize,
-    bit_depth: usize,
+    sample_format: SampleFormat,
 ) -> usize {
     packets_in_link_offset(link_offset, packet_time)
-        * rtp_packet_size(sampling_rate, packet_time, channels, bit_depth)
+        * rtp_packet_size(sample_rate, packet_time, channels, sample_format)
 }
 
-pub fn to_link_offset(samples: usize, sampling_rate: usize) -> usize {
-    f32::ceil((samples as f32 * 1000.0) / sampling_rate as f32) as usize
+pub fn to_link_offset(samples: usize, sample_rate: usize) -> usize {
+    f32::ceil((samples as f32 * 1000.0) / sample_rate as f32) as usize
 }
 
 pub fn set_realtime_priority() {
@@ -143,22 +146,21 @@ pub async fn open_browser(ip: IpAddr, port: u16) {
     });
 }
 
-pub fn read_i32_sample(payload: &[u8]) -> i32 {
-    let padded = pad_sample(payload);
-    i32::from_be_bytes(padded)
-}
+pub fn print_ifaces() {
+    let mut out = "No network interface specified. Available network interfaces:\n".to_owned();
 
-pub fn read_f32_sample(payload: &[u8]) -> f32 {
-    let i = read_i32_sample(payload);
-    (i as f64 / i32::MAX as f64) as f32
-}
-
-fn pad_sample(payload: &[u8]) -> [u8; 4] {
-    let mut sample = [0, 0, 0, 0];
-    for (i, b) in payload.iter().enumerate() {
-        sample[i] = *b;
+    for iface in datalink::interfaces() {
+        if iface.is_up()
+            && iface.is_running()
+            && !iface.is_loopback()
+            && !iface.ips.is_empty()
+            && iface.mac.is_some()
+        {
+            out += &format!("\t{}\n", iface.name);
+        }
     }
-    sample
+
+    eprintln!("{out}");
 }
 
 #[cfg(test)]

@@ -184,8 +184,8 @@ impl StatusActor {
                 Receiver::Created(desc, sdp) => {
                     let mut vec = vec![
                         (
-                            topic!("receivers", desc.id, "config", "bitDepth"),
-                            json!(desc.bit_depth),
+                            topic!("receivers", desc.id, "config", "sampleFormat"),
+                            json!(desc.sample_format),
                         ),
                         (
                             topic!("receivers", desc.id, "config", "channels"),
@@ -197,7 +197,7 @@ impl StatusActor {
                         ),
                         (
                             topic!("receivers", desc.id, "config", "sampleRate"),
-                            json!(desc.sampling_rate),
+                            json!(desc.sample_rate),
                         ),
                         (
                             topic!("receivers", desc.id, "config", "session", "id"),

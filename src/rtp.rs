@@ -28,7 +28,7 @@ use std::{
     hash::Hash,
 };
 
-#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Hash, Serialize, Deserialize)]
 pub struct Channel {
     transceiver_id: usize,
     channel_nr: usize,
@@ -47,6 +47,7 @@ impl Channel {
 pub struct OutputMatrix {
     channels: usize,
     mapping: HashMap<usize, (Channel, RxDescriptor)>,
+    rev_mapping: HashMap<Channel, Vec<usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,8 +58,21 @@ pub struct InputMatrix {
 
 impl OutputMatrix {
     pub fn default(channels: usize) -> OutputMatrix {
-        let mapping = HashMap::new();
-        OutputMatrix { channels, mapping }
+        let mapping = HashMap::with_capacity(channels);
+        let rev_mapping = HashMap::with_capacity(channels);
+        OutputMatrix {
+            channels,
+            mapping,
+            rev_mapping,
+        }
+    }
+
+    pub fn get_outputs(&self, ch: &Channel) -> Option<&Vec<usize>> {
+        self.rev_mapping.get(ch)
+    }
+
+    pub fn get_channel(&self, output: usize) -> Option<&(Channel, RxDescriptor)> {
+        self.mapping.get(&output)
     }
 
     pub fn auto_route(
@@ -88,6 +102,8 @@ impl OutputMatrix {
             }
         }
 
+        self.update_rev_mapping();
+
         Some(ports.into())
     }
 
@@ -104,7 +120,24 @@ impl OutputMatrix {
                 Entry::Vacant(_) => continue,
             }
         }
+
+        self.update_rev_mapping();
+
         ports.into()
+    }
+
+    fn update_rev_mapping(&mut self) {
+        self.rev_mapping.clear();
+        for (port, (ch, _)) in &self.mapping {
+            match self.rev_mapping.entry(*ch) {
+                Entry::Occupied(mut entry) => {
+                    entry.get_mut().push(*port);
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(vec![*port]);
+                }
+            }
+        }
     }
 }
 

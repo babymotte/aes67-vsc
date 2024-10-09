@@ -23,6 +23,7 @@ use crate::{
     status::Status,
     ReceiverId,
 };
+use shared_memory::ShmemError;
 use thiserror::Error;
 use tokio::sync::{
     mpsc::error::{SendError, TrySendError},
@@ -53,6 +54,8 @@ pub enum RtpError {
     RxError(#[from] RxError),
     #[error("jack error: {0}")]
     JackError(#[from] jack::Error),
+    #[error("shared memory error: {0}")]
+    ShmemError(#[from] ShmemError),
 }
 
 pub type RtpResult<T> = Result<T, RtpError>;
@@ -93,6 +96,8 @@ pub enum RxError {
     NoPlayoutDevice(String),
     #[error("status error: {0}")]
     StatusError(#[from] StatusError),
+    #[error("unknown sample format: {0}")]
+    UnknownSampleFormat(String),
     #[error("error: {0}")]
     Other(String),
 }
