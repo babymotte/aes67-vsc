@@ -39,8 +39,8 @@ struct State {
     clock: SharedOverlayClock,
     input_buffer: AudioBuffer,
     output_buffer: AudioBuffer,
-    input_sequence_numbers: Box<[Seq]>,
-    output_sequence_numbers: Box<[Seq]>,
+    input_sequence_numbers: Box<[Option<Seq>]>,
+    output_sequence_numbers: Box<[Option<Seq>]>,
 }
 
 pub async fn run(
@@ -70,8 +70,8 @@ pub async fn run(
 
     let jack_media_clock = None;
 
-    let input_sequence_numbers = init_buffer(inputs, |_| Seq::from(0));
-    let output_sequence_numbers = init_buffer(inputs, |_| Seq::from(0));
+    let input_sequence_numbers = init_buffer(inputs, |_| None);
+    let output_sequence_numbers = init_buffer(inputs, |_| None);
 
     let process = ClosureProcessHandler::with_state(
         State {
