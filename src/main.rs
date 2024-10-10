@@ -27,7 +27,10 @@ use aes67_vsc::{
 };
 use clap::Parser;
 use miette::{miette, IntoDiagnostic, Result};
-use pnet::datalink::{self, NetworkInterface};
+use pnet::{
+    datalink::{self, NetworkInterface},
+    ipnetwork::IpNetwork,
+};
 use std::{io, time::Duration};
 #[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
 use tikv_jemallocator::Jemalloc;
@@ -88,18 +91,7 @@ async fn main() -> Result<()> {
 
     set_realtime_priority();
 
-    Toplevel::new(move |s| async move {
-        s.start(SubsystemBuilder::new("aes67-vsc", |s| run(args, s)));
-    })
-    .catch_signals()
-    .handle_shutdown_requests(Duration::from_millis(1000))
-    .await?;
-
-    Ok(())
-}
-
-async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
-    let iface = if let Some(it) = get_network_iface(args.iface.as_deref()) {
+    let iface = if let Some(it) = get_network_iface(iface_name) {
         it
     } else {
         return Err(miette!("network interface not found"));
@@ -115,6 +107,19 @@ async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
         return Err(miette!("network interface has no MAC address"));
     }
 
+    Toplevel::new(move |s| async move {
+        s.start(SubsystemBuilder::new("aes67-vsc", move |s| {
+            run(args, s, ip)
+        }));
+    })
+    .catch_signals()
+    .handle_shutdown_requests(Duration::from_millis(1000))
+    .await?;
+
+    Ok(())
+}
+
+async fn run(args: Args, subsys: SubsystemHandle, ip: IpNetwork) -> Result<()> {
     let port = args.port;
     let link_offset = args.link_offset;
 
@@ -201,28 +206,11 @@ async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
     Ok(())
 }
 
-fn get_network_iface(name: Option<&str>) -> Option<NetworkInterface> {
-    match name {
-        Some(name) => {
-            for iface in datalink::interfaces() {
-                if iface.name == name {
-                    return Some(iface);
-                }
-            }
-            None
-        }
-        None => {
-            for iface in datalink::interfaces() {
-                if iface.is_up()
-                    && iface.is_running()
-                    && !iface.is_loopback()
-                    && !iface.ips.is_empty()
-                    && iface.mac.is_some()
-                {
-                    return Some(iface);
-                }
-            }
-            None
+fn get_network_iface(name: &str) -> Option<NetworkInterface> {
+    for iface in datalink::interfaces() {
+        if iface.name == name {
+            return Some(iface);
         }
     }
+    None
 }

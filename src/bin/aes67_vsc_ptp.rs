@@ -156,6 +156,8 @@ async fn run(
 
     let mut clients: Vec<(TcpStream, SocketAddr)> = Vec::new();
 
+    let mut counter = 0;
+
     loop {
         select! {
             _ = subsys.on_shutdown_requested() => break,
@@ -163,7 +165,7 @@ async fn run(
                 log::info!("Client connected: {}", client.1);
                 clients.push(client);
             },
-            _ = interval.tick() => update(&mut clients, &clock, &status).await?,
+            _ = interval.tick() => update(&mut clients, &clock, &status, &mut counter).await?,
             _ = &mut wb_on_disco => subsys.request_shutdown(),
         }
     }
@@ -175,7 +177,10 @@ async fn update(
     clients: &mut Vec<(TcpStream, SocketAddr)>,
     clock: &PtpClock,
     status: &StatusApi,
+    counter: &mut usize,
 ) -> Result<()> {
+    *counter += 1;
+
     let current_offset = current_offset(clock);
 
     let mut unresponsive = vec![];
@@ -201,10 +206,12 @@ async fn update(
 
     clients.retain(|(_, addr)| !unresponsive.contains(addr));
 
-    status
-        .publish(Status::Ptp(Ptp::SystemOffset(current_offset)))
-        .await
-        .into_diagnostic()?;
+    if *counter % 10 == 0 {
+        status
+            .publish(Status::Ptp(Ptp::SystemOffset(current_offset)))
+            .await
+            .into_diagnostic()?;
+    }
 
     Ok(())
 }

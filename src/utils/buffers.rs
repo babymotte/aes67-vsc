@@ -229,7 +229,8 @@ impl AudioBuffer {
                 // we can't really be sure, worst case is we pick up a wrong number here and have to wait for it to wrap around before we can start playing out
                 None => false,
             };
-            let muted = disabled || underrun || buf.is_muted();
+            // let muted = disabled || underrun || buf.is_muted();
+            let muted = disabled || buf.is_muted();
 
             if underrun {
                 if !disabled && underrun_timestamp.is_none() {

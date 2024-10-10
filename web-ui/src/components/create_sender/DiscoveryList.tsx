@@ -50,7 +50,7 @@ function DiscoveryListItem({ sdp }: { sdp: string }) {
   const sessionVersion = parsedSdp.origin?.sessionVersion;
   const ns = useNamespace();
   const receiver = useSubscribe<number>(
-    `${WB_ROOT_KEY}/${ns}/status/sessions/${sessionId}/${sessionVersion}/receiver`
+    `${WB_ROOT_KEY}/${ns}/rtp/status/sessions/${sessionId}/${sessionVersion}/receiver`
   );
 
   const createReceiver = useReceiveStream(sdp);
