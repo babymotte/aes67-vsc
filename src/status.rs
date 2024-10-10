@@ -18,7 +18,8 @@
 use crate::{
     actor::{Actor, ActorApi},
     error::{StatusError, StatusResult},
-    rtp::RxDescriptor,
+    rtp::{Channel, RxDescriptor},
+    utils::MediaClockTimestamp,
     ReceiverId,
 };
 use serde_json::json;
@@ -49,8 +50,8 @@ pub enum Receiver {
     SessionName(ReceiverId, String),
     Sdp(ReceiverId, String),
     Meter(ReceiverId, usize, u16),
-    BufferUnderrun(ReceiverId, u128),
-    BufferOverflow(ReceiverId, u128),
+    BufferUnderrun(usize, MediaClockTimestamp),
+    BufferOverflow(Channel, MediaClockTimestamp),
     BufferUsage(ReceiverId, usize, usize, usize),
     DroppedPackets(ReceiverId, usize),
     OutOfOrderPackets(ReceiverId, usize),
@@ -262,12 +263,18 @@ impl StatusActor {
                     json!(value),
                 )]),
                 Receiver::BufferUnderrun(id, value) => Action::Publish(vec![(
-                    topic!("receivers", id, "buffer", "underrun"),
-                    json!(value),
+                    topic!("outputs", id, "buffer", "underrun"),
+                    json!(value.timestamp),
                 )]),
                 Receiver::BufferOverflow(id, value) => Action::Publish(vec![(
-                    topic!("receivers", id, "buffer", "overflow"),
-                    json!(value),
+                    topic!(
+                        "receivers",
+                        id.transceiver_id,
+                        "buffer",
+                        "overflow",
+                        id.channel_nr
+                    ),
+                    json!(value.timestamp),
                 )]),
                 Receiver::BufferUsage(id, used, size, percent) => Action::Publish(vec![
                     (topic!("receivers", id, "buffer", "size"), json!(size)),

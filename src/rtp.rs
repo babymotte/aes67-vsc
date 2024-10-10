@@ -30,8 +30,8 @@ use std::{
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Hash, Serialize, Deserialize)]
 pub struct Channel {
-    transceiver_id: usize,
-    channel_nr: usize,
+    pub transceiver_id: usize,
+    pub channel_nr: usize,
 }
 
 impl Channel {

@@ -682,6 +682,8 @@ impl ReceiveLoop {
             }
         }
 
+        self.audio_buffer.mute_channels(&self.desc, &self.matrix);
+
         log::info!("Receiver {} stopped.", self.desc.id);
     }
 

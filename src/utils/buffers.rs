@@ -20,7 +20,7 @@ use crate::{
     error::RtpResult,
     rtp::{Channel, OutputMatrix, RxDescriptor},
     AudioFormat, AudioSystemConfig, BufferConfig, BufferFormat, FrameFormat, SampleFormat,
-    SampleReader,
+    SampleMetadata, SampleReader,
 };
 use rtp_rs::RtpReader;
 use serde_json::json;
@@ -188,6 +188,7 @@ impl AudioBuffer {
 
         let reception_timestamp =
             MediaClockTimestamp::new(rtp.timestamp(), self.format.audio_format.sample_rate);
+
         let playout_timestamp = reception_timestamp + self.format.buffer_len / 2;
 
         let bytes_per_buffer_sample = self
@@ -220,8 +221,41 @@ impl AudioBuffer {
                         let sample_start =
                             buffer_frame_index * bytes_per_buffer_frame + index_in_frame;
                         let sample_end = sample_start + bytes_per_buffer_sample;
-                        // TODO sample.len() might be 2 for L16 senders, convert to L24 before inserting
-                        buffer[sample_start..sample_end].copy_from_slice(sample);
+                        SampleFormat::to_internal_format(
+                            sample,
+                            &mut buffer[sample_start..sample_end],
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn mute_channels(&mut self, desc: &RxDescriptor, matrix: &OutputMatrix) {
+        let bytes_per_buffer_sample = self
+            .format
+            .audio_format
+            .frame_format
+            .sample_format
+            .bytes_per_sample();
+
+        // the x scale of the buffer when seen as a two-dimensional array
+        let bytes_per_buffer_frame = self.format.audio_format.frame_format.bytes_per_frame();
+        // the y scale of the buffer when seen as a two-dimensional array
+        let frames_per_buffer = self.format.frames_per_buffer();
+
+        let buffer = self.buffer();
+
+        for buffer_frame_index in 0..frames_per_buffer {
+            for ch_nr in 0..desc.channels {
+                let receiver_channel = Channel::new(desc.id, ch_nr);
+                if let Some(outputs) = matrix.get_outputs(&receiver_channel) {
+                    for output in outputs {
+                        let index_in_frame = output * bytes_per_buffer_sample;
+                        let sample_start =
+                            buffer_frame_index * bytes_per_buffer_frame + index_in_frame;
+                        buffer[sample_start].set_consumed(false);
+                        buffer[sample_start].set_muted(true);
                     }
                 }
             }
@@ -243,22 +277,26 @@ impl AudioBuffer {
         let end = frame_end * bytes_per_buffer_frame;
 
         if end < start {
-            let slice = &mut buffer[start..];
-            slice.fill(0u8);
-            let slice = &mut buffer[..end];
-            slice.fill(0u8);
+            Self::clear_slice(&mut buffer[start..]);
+            Self::clear_slice(&mut buffer[..end]);
         } else {
-            let slice = &mut buffer[start..end];
-            slice.fill(0u8);
+            Self::clear_slice(&mut buffer[start..end]);
         }
     }
 
-    pub fn read<S>(
+    fn clear_slice(slice: &mut [u8]) {
+        for sample in slice.chunks_mut(SampleFormat::Internal.bytes_per_sample()) {
+            sample[0].set_consumed(true);
+        }
+    }
+
+    pub fn read<S: Default>(
         &mut self,
         playout_timestamp: MediaClockTimestamp,
         channel: usize,
         output_buffer: &mut [S],
-    ) where
+    ) -> Option<MediaClockTimestamp>
+    where
         SampleFormat: SampleReader<S>,
     {
         let bytes_per_buffer_sample = self
@@ -276,6 +314,8 @@ impl AudioBuffer {
         // TODO make sure this does not break at wrap around!
         let frame_start = playout_timestamp.timestamp as usize % frames_per_buffer;
 
+        let mut underrun = None;
+
         for (frame, sample) in output_buffer.iter_mut().enumerate() {
             let buffer_frame_index = (frame_start + frame) % frames_per_buffer;
 
@@ -283,8 +323,17 @@ impl AudioBuffer {
             let sample_start = buffer_frame_index * bytes_per_buffer_frame + sample_index_in_frame;
             let sample_end = sample_start + bytes_per_buffer_sample;
             let buf = &mut buffer[sample_start..sample_end];
-            *sample = sample_format.read_sample(buf);
+            *sample = if let Some(s) = sample_format.read_sample(buf) {
+                s
+            } else {
+                if underrun.is_none() {
+                    underrun = Some(playout_timestamp + frame);
+                }
+                S::default()
+            }
         }
+
+        underrun
     }
 
     fn buffer<'a>(&'a mut self) -> &'a mut [u8] {
@@ -326,11 +375,11 @@ pub fn cretae_shared_memory_buffers(
 
     let input_frame_format = FrameFormat {
         channels: inputs,
-        sample_format: SampleFormat::L24,
+        sample_format: SampleFormat::Internal,
     };
     let output_frame_format = FrameFormat {
         channels: outputs,
-        sample_format: SampleFormat::L24,
+        sample_format: SampleFormat::Internal,
     };
 
     let input_audio_format = AudioFormat {

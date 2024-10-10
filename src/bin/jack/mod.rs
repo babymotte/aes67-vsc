@@ -129,7 +129,10 @@ fn process(state: &mut State, client: &Client, ps: &ProcessScope) -> Control {
 
     for (port_nr, port) in state.out_ports.iter_mut().enumerate() {
         let buffer = port.as_mut_slice(ps);
-        state.output_buffer.read(jack_media_clock, port_nr, buffer);
+        if let Some(underrun) = state.output_buffer.read(jack_media_clock, port_nr, buffer) {
+            // let status = Status::Receiver(Receiver::BufferUnderrun(port_nr, underrun));
+            // state.status.publish_blocking(status).ok();
+        }
     }
 
     // state
