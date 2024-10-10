@@ -18,14 +18,15 @@
 use aes67_vsc::{
     error::RtpResult,
     ptp::statime_linux::SharedOverlayClock,
-    status::StatusApi,
-    utils::{open_shared_memory_buffers, AudioBuffer, MediaClockTimestamp},
+    status::{Output, Status, StatusApi},
+    utils::{init_buffer, open_shared_memory_buffers, AudioBuffer, MediaClockTimestamp},
     AudioSystemConfig,
 };
 use jack::{
     contrib::ClosureProcessHandler, AudioIn, AudioOut, Client, ClientOptions, Control, Port,
     ProcessScope,
 };
+use rtp_rs::Seq;
 use tokio_graceful_shutdown::SubsystemHandle;
 
 const CLIENT_NAME: &str = "AES67 VirtualSoundCard";
@@ -38,6 +39,8 @@ struct State {
     clock: SharedOverlayClock,
     input_buffer: AudioBuffer,
     output_buffer: AudioBuffer,
+    input_sequence_numbers: Box<[Seq]>,
+    output_sequence_numbers: Box<[Seq]>,
 }
 
 pub async fn run(
@@ -67,6 +70,9 @@ pub async fn run(
 
     let jack_media_clock = None;
 
+    let input_sequence_numbers = init_buffer(inputs, |_| Seq::from(0));
+    let output_sequence_numbers = init_buffer(inputs, |_| Seq::from(0));
+
     let process = ClosureProcessHandler::with_state(
         State {
             _in_ports,
@@ -76,6 +82,8 @@ pub async fn run(
             clock,
             input_buffer,
             output_buffer,
+            input_sequence_numbers,
+            output_sequence_numbers,
         },
         process,
         |_, _, _| Control::Continue,
@@ -129,15 +137,18 @@ fn process(state: &mut State, client: &Client, ps: &ProcessScope) -> Control {
 
     for (port_nr, port) in state.out_ports.iter_mut().enumerate() {
         let buffer = port.as_mut_slice(ps);
-        if let Some(underrun) = state.output_buffer.read(jack_media_clock, port_nr, buffer) {
-            // let status = Status::Receiver(Receiver::BufferUnderrun(port_nr, underrun));
-            // state.status.publish_blocking(status).ok();
+        let seq = state.output_sequence_numbers[port_nr];
+
+        let (seq, underrun) = state
+            .output_buffer
+            .read(jack_media_clock, seq, port_nr, buffer);
+        state.output_sequence_numbers[port_nr] = seq;
+
+        if let Some(underrun) = underrun {
+            let status = Status::Output(Output::BufferUnderrun(port_nr, underrun));
+            state.status.publish_blocking(status).ok();
         }
     }
-
-    // state
-    //     .output_buffer
-    //     .clear(jack_media_clock, client.buffer_size() as usize);
 
     // TODO read transmitters
 

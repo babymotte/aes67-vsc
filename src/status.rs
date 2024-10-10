@@ -33,6 +33,7 @@ pub enum Status {
     UsedInputChannels(usize, usize),
     UsedOutputChannels(usize, usize),
     Receiver(Receiver),
+    Output(Output),
 }
 
 pub enum Transmitter {
@@ -50,11 +51,18 @@ pub enum Receiver {
     SessionName(ReceiverId, String),
     Sdp(ReceiverId, String),
     Meter(ReceiverId, usize, u16),
-    BufferUnderrun(usize, MediaClockTimestamp),
+    BufferUnderrun(Channel, MediaClockTimestamp),
     BufferOverflow(Channel, MediaClockTimestamp),
     BufferUsage(ReceiverId, usize, usize, usize),
     DroppedPackets(ReceiverId, usize),
     OutOfOrderPackets(ReceiverId, usize),
+}
+
+#[derive(Debug, Clone)]
+pub enum Output {
+    Meter(usize, usize, u16),
+    BufferUnderrun(usize, MediaClockTimestamp),
+    BufferOverflow(usize, MediaClockTimestamp),
 }
 
 #[derive(Clone)]
@@ -263,7 +271,13 @@ impl StatusActor {
                     json!(value),
                 )]),
                 Receiver::BufferUnderrun(id, value) => Action::Publish(vec![(
-                    topic!("outputs", id, "buffer", "underrun"),
+                    topic!(
+                        "receivers",
+                        id.transceiver_id,
+                        "buffer",
+                        "underrun",
+                        id.channel_nr
+                    ),
                     json!(value.timestamp),
                 )]),
                 Receiver::BufferOverflow(id, value) => Action::Publish(vec![(
@@ -291,6 +305,20 @@ impl StatusActor {
                 Receiver::OutOfOrderPackets(id, count) => Action::Publish(vec![(
                     topic!("receivers", id, "packets", "outOfOrder"),
                     json!(count),
+                )]),
+            },
+            Status::Output(output) => match output {
+                Output::Meter(id, channel, value) => Action::Publish(vec![(
+                    topic!("receivers", id, "meter", channel),
+                    json!(value),
+                )]),
+                Output::BufferUnderrun(channel, value) => Action::Publish(vec![(
+                    topic!("outputs", channel, "buffer", "underrun"),
+                    json!(value.timestamp),
+                )]),
+                Output::BufferOverflow(channel, value) => Action::Publish(vec![(
+                    topic!("outputs", channel, "buffer", "overflow"),
+                    json!(value.timestamp),
                 )]),
             },
         }

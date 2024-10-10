@@ -17,6 +17,7 @@
 
 use error::RxError;
 use rtp::RxDescriptor;
+use rtp_rs::Seq;
 use serde::{Deserialize, Serialize};
 use std::{str::FromStr, time::Duration};
 
@@ -146,34 +147,34 @@ impl FromStr for SampleFormat {
 }
 
 pub trait SampleReader<S> {
-    fn read_sample(&self, buffer: &mut [u8]) -> Option<S>;
+    fn read_sample(&self, buffer: &[u8]) -> S;
 }
 
 impl SampleReader<f32> for SampleFormat {
-    fn read_sample(&self, buffer: &mut [u8]) -> Option<f32> {
+    fn read_sample(&self, buffer: &[u8]) -> f32 {
         self.read_f32(buffer)
     }
 }
 
 impl SampleReader<i32> for SampleFormat {
-    fn read_sample(&self, buffer: &mut [u8]) -> Option<i32> {
+    fn read_sample(&self, buffer: &[u8]) -> i32 {
         self.read_i32(buffer)
     }
 }
 
 impl SampleFormat {
-    fn read_f32(&self, buffer: &mut [u8]) -> Option<f32> {
+    fn read_f32(&self, buffer: &[u8]) -> f32 {
         match self {
-            SampleFormat::L16 => Some(bytes_to_f32_2_bytes(buffer)),
-            SampleFormat::L24 => Some(bytes_to_f32_3_bytes(buffer)),
+            SampleFormat::L16 => bytes_to_f32_2_bytes(buffer),
+            SampleFormat::L24 => bytes_to_f32_3_bytes(buffer),
             SampleFormat::Internal => internal_bytes_to_f32(buffer),
         }
     }
 
-    fn read_i32(&self, buffer: &mut [u8]) -> Option<i32> {
+    fn read_i32(&self, buffer: &[u8]) -> i32 {
         match self {
-            SampleFormat::L16 => Some(bytes_to_i32_2_bytes(buffer)),
-            SampleFormat::L24 => Some(bytes_to_i32_3_bytes(buffer)),
+            SampleFormat::L16 => bytes_to_i32_2_bytes(buffer),
+            SampleFormat::L24 => bytes_to_i32_3_bytes(buffer),
             SampleFormat::Internal => internal_bytes_to_i32(buffer),
         }
     }
@@ -182,56 +183,48 @@ impl SampleFormat {
         match self {
             SampleFormat::L16 => 2,
             SampleFormat::L24 => 3,
-            SampleFormat::Internal => 4,
+            SampleFormat::Internal => 6,
         }
     }
 
-    pub fn to_internal_format(source: &[u8], target: &mut [u8]) {
-        if !target.len() == 4 {
-            panic!("target buffer must have length 4 but was {}", target.len())
+    pub fn to_internal_format(source: &[u8], mut target: &mut [u8], seq: Seq) {
+        if target.len() != 6 {
+            panic!("target buffer must have length 6 but was {}", target.len())
         }
 
         target[0] = 0u8;
-        let target = match source.len() {
+        target[1..3].copy_from_slice(&u16::from(seq).to_be_bytes());
+        let t = match source.len() {
             2 => {
-                target[0].set_format(SampleFormat::L16);
-                &mut target[2..]
+                target.set_format(SampleFormat::L16);
+                &mut target[4..]
             }
-            3 => &mut target[1..],
+            3 => &mut target[3..],
             len => panic!("soure buffer must have length 2 or 3 but was {len}"),
         };
-        target.copy_from_slice(source);
+        t.copy_from_slice(source);
+    }
+
+    pub fn init_internal<'a>() -> [u8; 6] {
+        let mut sample = [0u8; 6];
+        (&mut sample[..]).set_disabled(true);
+        (&mut sample[..]).set_muted(true);
+        sample
     }
 }
 
-fn internal_bytes_to_f32(bytes: &mut [u8]) -> Option<f32> {
-    if bytes[0].is_consumed() {
-        return None;
-    }
-    // bytes[0].set_consumed(true);
-    if bytes[0].is_muted() {
-        return Some(0.0);
-    }
-    // TODO apply other controls
-    match bytes[0].get_format() {
-        SampleFormat::L16 => Some(bytes_to_f32_2_bytes(&bytes[2..4])),
-        SampleFormat::L24 => Some(bytes_to_f32_3_bytes(&bytes[1..4])),
+fn internal_bytes_to_f32(bytes: &[u8]) -> f32 {
+    match (&*bytes).get_format() {
+        SampleFormat::L16 => bytes_to_f32_2_bytes(&bytes[4..6]),
+        SampleFormat::L24 => bytes_to_f32_3_bytes(&bytes[3..6]),
         SampleFormat::Internal => panic!("recursive use of internal sample format"),
     }
 }
 
-fn internal_bytes_to_i32(bytes: &mut [u8]) -> Option<i32> {
-    if bytes[0].is_consumed() {
-        return None;
-    }
-    // bytes[0].set_consumed(true);
-    if bytes[0].is_muted() {
-        return Some(0);
-    }
-    // TODO apply other controls
-    match bytes[0].get_format() {
-        SampleFormat::L16 => Some(bytes_to_i32_2_bytes(&bytes[2..4])),
-        SampleFormat::L24 => Some(bytes_to_i32_3_bytes(&bytes[1..4])),
+fn internal_bytes_to_i32(bytes: &[u8]) -> i32 {
+    match (&*bytes).get_format() {
+        SampleFormat::L16 => bytes_to_i32_2_bytes(&bytes[4..6]),
+        SampleFormat::L24 => bytes_to_i32_3_bytes(&bytes[3..6]),
         SampleFormat::Internal => panic!("recursive use of internal sample format"),
     }
 }
@@ -271,66 +264,82 @@ fn bytes_to_i32_3_bytes(bytes: &[u8]) -> i32 {
 }
 
 pub trait SampleMetadata {
-    fn is_consumed(&self) -> bool;
-    fn set_consumed(&mut self, consumed: bool);
+    fn is_disabled(&self) -> bool;
     fn get_format(&self) -> SampleFormat;
-    fn set_format(&mut self, sample_format: SampleFormat);
     fn is_muted(&self) -> bool;
-    fn set_muted(&mut self, muted: bool);
     fn is_phase_inverted(&self) -> bool;
-    fn set_phase_inverted(&mut self, phase_inverted: bool);
+    fn sequence_number(&self) -> Seq;
 }
 
-impl SampleMetadata for u8 {
-    fn is_consumed(&self) -> bool {
-        (self >> 7) & 1 == 1
-    }
+pub trait SampleMetadataMut {
+    fn set_disabled(&mut self, disabled: bool);
+    fn set_format(&mut self, sample_format: SampleFormat);
+    fn set_muted(&mut self, muted: bool);
+    fn set_phase_inverted(&mut self, phase_inverted: bool);
+    fn set_sequence_number(&mut self, sequence_number: Seq);
+}
 
-    fn set_consumed(&mut self, value: bool) {
-        if value {
-            *self |= 0b10000000;
-        } else {
-            *self &= 0b01111111;
-        }
+impl SampleMetadata for &[u8] {
+    fn is_disabled(&self) -> bool {
+        (self[0] >> 7) & 1 == 1
     }
 
     fn get_format(&self) -> SampleFormat {
-        match (self >> 6) & 1 {
+        match (self[0] >> 6) & 1 {
             1 => SampleFormat::L16,
             _ => SampleFormat::L24,
         }
     }
 
-    fn set_format(&mut self, value: SampleFormat) {
-        if value == SampleFormat::L16 {
-            *self |= 0b01000000;
+    fn is_muted(&self) -> bool {
+        (self[0] >> 5) & 1 == 1
+    }
+
+    fn is_phase_inverted(&self) -> bool {
+        (self[0] >> 4) & 1 == 1
+    }
+
+    fn sequence_number(&self) -> Seq {
+        let seq = u16::from_be_bytes([self[1], self[2]]);
+        Seq::from(seq)
+    }
+}
+
+impl SampleMetadataMut for &mut [u8] {
+    fn set_disabled(&mut self, value: bool) {
+        if value {
+            self[0] |= 0b10000000;
         } else {
-            *self &= 0b10111111;
+            self[0] &= 0b01111111;
         }
     }
 
-    fn is_muted(&self) -> bool {
-        (self >> 5) & 1 == 1
+    fn set_format(&mut self, value: SampleFormat) {
+        if value == SampleFormat::L16 {
+            self[0] |= 0b01000000;
+        } else {
+            self[0] &= 0b10111111;
+        }
     }
 
     fn set_muted(&mut self, value: bool) {
         if value {
-            *self |= 0b00100000;
+            self[0] |= 0b00100000;
         } else {
-            *self &= 0b11011111;
+            self[0] &= 0b11011111;
         }
-    }
-
-    fn is_phase_inverted(&self) -> bool {
-        (self >> 4) & 1 == 1
     }
 
     fn set_phase_inverted(&mut self, value: bool) {
         if value {
-            *self |= 0b00010000;
+            self[0] |= 0b00010000;
         } else {
-            *self &= 0b11101111;
+            self[0] &= 0b11101111;
         }
+    }
+
+    fn set_sequence_number(&mut self, sequence_number: Seq) {
+        self[1..2].copy_from_slice(&u16::from(sequence_number).to_be_bytes());
     }
 }
 
@@ -352,46 +361,46 @@ mod tests {
     use crate::SampleFormat;
 
     #[test]
-    fn test_u8_is_consumed() {
-        let byte = 0b10001010u8;
+    fn test_u8_is_disabled() {
+        let byte = &[0b10001010u8, 0xFF, 0x00][..];
         assert!(
-            byte.is_consumed(),
-            "Expected is_consumed to be true when most significant bit is 1."
+            byte.is_disabled(),
+            "Expected is_disabled to be true when most significant bit is 1."
         );
 
-        let byte = 0b00101001u8;
+        let byte = &[0b00101001u8, 0xFF, 0x00][..];
         assert!(
-            !byte.is_consumed(),
-            "Expected is_consumed to be false when most significant bit is 0."
+            !byte.is_disabled(),
+            "Expected is_disabled to be false when most significant bit is 0."
         );
     }
 
     #[test]
-    fn test_u8_set_consumed() {
-        let mut byte = 0b11100100u8;
-        byte.set_consumed(false);
+    fn test_u8_set_disabled() {
+        let mut byte = &mut [0b11100100u8, 0xFF, 0x00][..];
+        byte.set_disabled(false);
         assert!(
-            !byte.is_consumed(),
-            "Expected is_consumed to be false after setting it to false."
+            !(&*byte).is_disabled(),
+            "Expected is_disabled to be false after setting it to false."
         );
 
-        byte.set_consumed(true);
+        byte.set_disabled(true);
         assert!(
-            byte.is_consumed(),
-            "Expected is_consumed to be true after setting it to true."
+            (&*byte).is_disabled(),
+            "Expected is_disabled to be true after setting it to true."
         );
     }
 
     #[test]
     fn test_u8_get_format() {
-        let byte = 0b01110010u8;
+        let byte = &[0b01110010u8, 0xFF, 0x00][..];
         assert_eq!(
             byte.get_format(),
             SampleFormat::L16,
             "Expected format to be L16 when second most significant bit is 1."
         );
 
-        let byte = 0b00110010u8;
+        let byte = &[0b00110010u8, 0xFF, 0x00][..];
         assert_eq!(
             byte.get_format(),
             SampleFormat::L24,
@@ -401,17 +410,17 @@ mod tests {
 
     #[test]
     fn test_u8_set_format() {
-        let mut byte = 0b0000000u8;
+        let mut byte = &mut [0b0000000u8, 0xFF, 0x00][..];
         byte.set_format(SampleFormat::L16);
         assert_eq!(
-            byte.get_format(),
+            (&*byte).get_format(),
             SampleFormat::L16,
             "Expected format to be L16 after setting it to L16."
         );
 
         byte.set_format(SampleFormat::L24);
         assert_eq!(
-            byte.get_format(),
+            (&*byte).get_format(),
             SampleFormat::L24,
             "Expected format to be L24 after setting it to L24."
         );
@@ -419,13 +428,13 @@ mod tests {
 
     #[test]
     fn test_u8_is_muted() {
-        let byte = 0b11110010u8;
+        let byte = &[0b11110010u8, 0xFF, 0x00][..];
         assert!(
             byte.is_muted(),
             "Expected is_muted to be true when third most significant bit is 1."
         );
 
-        let byte = 0b11000100u8;
+        let byte = &[0b11000100u8, 0xFF, 0x00][..];
         assert!(
             !byte.is_muted(),
             "Expected is_muted to be false when third most significant bit is 0."
@@ -434,29 +443,29 @@ mod tests {
 
     #[test]
     fn test_u8_set_muted() {
-        let mut byte = 0b01010100u8;
+        let mut byte = &mut [0b01010100u8, 0xFF, 0x00][..];
         byte.set_muted(true);
         assert!(
-            byte.is_muted(),
+            (&*byte).is_muted(),
             "Expected is_muted to be true after setting it to true."
         );
 
         byte.set_muted(false);
         assert!(
-            !byte.is_muted(),
+            !(&*byte).is_muted(),
             "Expected is_muted to be false after setting it to false."
         );
     }
 
     #[test]
     fn test_u8_is_phase_inverted() {
-        let byte = 0b11010100u8;
+        let byte = &[0b11010100u8, 0xFF, 0x00][..];
         assert!(
             byte.is_phase_inverted(),
             "Expected is_phase_inverted to be true when fourth most significant bit is 1."
         );
 
-        let byte = 0b10100101u8;
+        let byte = &[0b10100101u8, 0xFF, 0x00][..];
         assert!(
             !byte.is_phase_inverted(),
             "Expected is_phase_inverted to be false when fourth most significant bit is 0."
@@ -465,36 +474,46 @@ mod tests {
 
     #[test]
     fn test_u8_set_phase_inverted() {
-        let mut byte = 0b10100101u8;
+        let mut byte = &mut [0b10100101u8, 0xFF, 0x00][..];
         byte.set_phase_inverted(true);
         assert!(
-            byte.is_phase_inverted(),
+            (&*byte).is_phase_inverted(),
             "Expected is_phase_inverted to be true after setting it to true."
         );
 
         byte.set_phase_inverted(false);
         assert!(
-            !byte.is_phase_inverted(),
+            !(&*byte).is_phase_inverted(),
             "Expected is_phase_inverted to be false after setting it to false."
         );
     }
 
     #[test]
     fn test_sample_reader_default_values() {
-        let mut target = [4, 4, 4, 4];
+        let mut target = [4, 4, 4, 4, 4, 4];
 
         let src = [1, 2, 3];
-        SampleFormat::to_internal_format(&src, &mut target);
-        assert!(!target[0].is_consumed());
-        assert_eq!(target[0].get_format(), SampleFormat::L24);
-        assert!(!target[0].is_muted());
-        assert!(!target[0].is_phase_inverted());
+        SampleFormat::to_internal_format(&src, &mut target, Seq::from(0));
+        assert!(!(&target[..]).is_disabled());
+        assert_eq!((&target[..]).get_format(), SampleFormat::L24);
+        assert!(!(&target[..]).is_muted());
+        assert!(!(&target[..]).is_phase_inverted());
 
         let src = [1, 2];
-        SampleFormat::to_internal_format(&src, &mut target);
-        assert!(!target[0].is_consumed());
-        assert_eq!(target[0].get_format(), SampleFormat::L16);
-        assert!(!target[0].is_muted());
-        assert!(!target[0].is_phase_inverted());
+        SampleFormat::to_internal_format(&src, &mut target, Seq::from(0));
+        assert!(!(&target[..]).is_disabled());
+        assert_eq!((&target[..]).get_format(), SampleFormat::L16);
+        assert!(!(&target[..]).is_muted());
+        assert!(!(&target[..]).is_phase_inverted());
+    }
+
+    #[test]
+    fn init_sample_is_disabled() {
+        assert!((&SampleFormat::init_internal()[..]).is_disabled());
+    }
+
+    #[test]
+    fn init_sample_is_muted() {
+        assert!((&SampleFormat::init_internal()[..]).is_muted());
     }
 }

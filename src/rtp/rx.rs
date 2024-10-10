@@ -682,7 +682,7 @@ impl ReceiveLoop {
             }
         }
 
-        self.audio_buffer.mute_channels(&self.desc, &self.matrix);
+        self.audio_buffer.disable_channels(&self.desc, &self.matrix);
 
         log::info!("Receiver {} stopped.", self.desc.id);
     }
@@ -690,6 +690,7 @@ impl ReceiveLoop {
     async fn process_packet(&mut self, len: usize, addr: SocketAddr) {
         if addr.ip() == self.desc.origin_ip {
             self.update_buffer_usage();
+            // TODO only insert packet if sequence number is consistent with timestamp
             self.audio_buffer
                 .insert(&self.rtp_buffer[0..len], &self.desc, &self.matrix);
         } else {

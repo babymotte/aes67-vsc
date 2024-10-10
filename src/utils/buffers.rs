@@ -20,9 +20,9 @@ use crate::{
     error::RtpResult,
     rtp::{Channel, OutputMatrix, RxDescriptor},
     AudioFormat, AudioSystemConfig, BufferConfig, BufferFormat, FrameFormat, SampleFormat,
-    SampleMetadata, SampleReader,
+    SampleMetadata, SampleMetadataMut, SampleReader,
 };
-use rtp_rs::RtpReader;
+use rtp_rs::{RtpReader, Seq};
 use serde_json::json;
 use shared_memory::ShmemConf;
 use std::{
@@ -123,10 +123,16 @@ pub fn create_audio_buffer(format: BufferFormat) -> RtpResult<(AudioBuffer, Stri
     // fs::remove_file(flink).ok();
     let len = format.bytes_per_buffer();
     log::info!("Creating shared memory buffer with length {} …", len);
-    let shared_memory = ShmemConf::new()
+    let mut shared_memory = ShmemConf::new()
         .size(format.bytes_per_buffer())
         // .flink(flink)
         .create()?;
+
+    let slice = unsafe { shared_memory.as_slice_mut() };
+
+    for sample in slice.chunks_mut(SampleFormat::Internal.bytes_per_sample()) {
+        sample.copy_from_slice(&SampleFormat::init_internal());
+    }
 
     let shared_memory_prt = shared_memory.as_ptr() as usize;
     let id = shared_memory.get_os_id().to_owned();
@@ -224,6 +230,7 @@ impl AudioBuffer {
                         SampleFormat::to_internal_format(
                             sample,
                             &mut buffer[sample_start..sample_end],
+                            rtp.sequence_number(),
                         );
                     }
                 }
@@ -231,7 +238,7 @@ impl AudioBuffer {
         }
     }
 
-    pub fn mute_channels(&mut self, desc: &RxDescriptor, matrix: &OutputMatrix) {
+    pub fn disable_channels(&mut self, desc: &RxDescriptor, matrix: &OutputMatrix) {
         let bytes_per_buffer_sample = self
             .format
             .audio_format
@@ -254,48 +261,23 @@ impl AudioBuffer {
                         let index_in_frame = output * bytes_per_buffer_sample;
                         let sample_start =
                             buffer_frame_index * bytes_per_buffer_frame + index_in_frame;
-                        buffer[sample_start].set_consumed(false);
-                        buffer[sample_start].set_muted(true);
+                        let mut sample =
+                            &mut buffer[sample_start..sample_start + bytes_per_buffer_sample];
+                        sample.set_disabled(true);
+                        sample.set_muted(true);
                     }
                 }
             }
         }
     }
 
-    pub fn clear(&mut self, start_timestamp: MediaClockTimestamp, frames: usize) {
-        // the x scale of the buffer when seen as a two-dimensional array
-        let bytes_per_buffer_frame = self.format.audio_format.frame_format.bytes_per_frame();
-        // the y scale of the buffer when seen as a two-dimensional array
-        let frames_per_buffer = self.format.frames_per_buffer();
-
-        let buffer = self.buffer();
-
-        let frame_start = start_timestamp.timestamp as usize % frames_per_buffer;
-        let frame_end = (start_timestamp + frames).timestamp as usize % frames_per_buffer;
-
-        let start = frame_start * bytes_per_buffer_frame;
-        let end = frame_end * bytes_per_buffer_frame;
-
-        if end < start {
-            Self::clear_slice(&mut buffer[start..]);
-            Self::clear_slice(&mut buffer[..end]);
-        } else {
-            Self::clear_slice(&mut buffer[start..end]);
-        }
-    }
-
-    fn clear_slice(slice: &mut [u8]) {
-        for sample in slice.chunks_mut(SampleFormat::Internal.bytes_per_sample()) {
-            sample[0].set_consumed(true);
-        }
-    }
-
     pub fn read<S: Default>(
         &mut self,
         playout_timestamp: MediaClockTimestamp,
+        seq: Seq,
         channel: usize,
         output_buffer: &mut [S],
-    ) -> Option<MediaClockTimestamp>
+    ) -> (Seq, Option<MediaClockTimestamp>)
     where
         SampleFormat: SampleReader<S>,
     {
@@ -314,7 +296,9 @@ impl AudioBuffer {
         // TODO make sure this does not break at wrap around!
         let frame_start = playout_timestamp.timestamp as usize % frames_per_buffer;
 
-        let mut underrun = None;
+        let mut underrun_timestamp = None;
+
+        let mut sequence_number = seq;
 
         for (frame, sample) in output_buffer.iter_mut().enumerate() {
             let buffer_frame_index = (frame_start + frame) % frames_per_buffer;
@@ -322,18 +306,31 @@ impl AudioBuffer {
             let sample_index_in_frame = channel * bytes_per_buffer_sample;
             let sample_start = buffer_frame_index * bytes_per_buffer_frame + sample_index_in_frame;
             let sample_end = sample_start + bytes_per_buffer_sample;
-            let buf = &mut buffer[sample_start..sample_end];
-            *sample = if let Some(s) = sample_format.read_sample(buf) {
-                s
-            } else {
-                if underrun.is_none() {
-                    underrun = Some(playout_timestamp + frame);
+            let buf = &buffer[sample_start..sample_end];
+
+            let disabled = buf.is_disabled();
+            let seq = buf.sequence_number();
+            // TODO this will fail to detect missed packets if link offset == packet time, figure out at which sample exactly we expect the sequence number to go up
+            let underrun = !(sequence_number == seq || sequence_number.precedes(seq));
+            let muted = disabled || underrun || buf.is_muted();
+
+            if underrun {
+                if !disabled && underrun_timestamp.is_none() {
+                    underrun_timestamp = Some(playout_timestamp + frame);
                 }
-                S::default()
+                sequence_number = sequence_number.next();
+            } else {
+                sequence_number = seq;
             }
+
+            *sample = if muted {
+                S::default()
+            } else {
+                sample_format.read_sample(buf)
+            };
         }
 
-        underrun
+        (sequence_number, underrun_timestamp)
     }
 
     fn buffer<'a>(&'a mut self) -> &'a mut [u8] {
