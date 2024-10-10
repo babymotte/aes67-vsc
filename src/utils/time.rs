@@ -16,11 +16,17 @@
  */
 
 use super::frames_per_link_offset_buffer;
+use crate::error::RtpResult;
+use libc::{clock_gettime, timespec, CLOCK_TAI};
 use std::{
     cmp::Ordering,
     fmt::Display,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     ops::{Add, Sub},
+    sync::{atomic::AtomicI64, Arc},
+    time::Duration,
 };
+use tokio::{io::AsyncReadExt, net::TcpStream, spawn, time::sleep};
 
 #[derive(Debug, Clone, Copy)]
 pub struct MediaClockTimestamp {
@@ -173,19 +179,95 @@ pub fn wrap_u64(value: u64) -> u32 {
     (value % (u32::MAX as u64 + 1)) as u32
 }
 
-// fn time_nanos() -> u128 {
-//     let mut ts: timespec = timespec {
-//         tv_sec: 0,
-//         tv_nsec: 0,
-//     };
-//     unsafe {
-//         clock_gettime(CLOCK_REALTIME, &mut ts);
-//     }
-//     if ts.tv_sec < 0 {
-//         panic!("your system clock is seriously messed up");
-//     }
-//     Duration::from_secs(ts.tv_sec as u64).as_nanos() + ts.tv_nsec as u128
-// }
+#[derive(Clone)]
+pub struct RemoteMediaClock {
+    offset: Arc<AtomicI64>,
+    sample_rate: usize,
+}
+
+impl RemoteMediaClock {
+    pub async fn connect(port: u16, sample_rate: usize) -> RtpResult<Self> {
+        let offset = Arc::new(AtomicI64::new(0));
+        let task_offset = offset.clone();
+
+        spawn(async move {
+            loop {
+                match TcpStream::connect(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                    port,
+                ))
+                .await
+                {
+                    Ok(socket) => read_offset(socket, &task_offset).await,
+                    Err(e) => {
+                        log::error!(
+                            "Could not connect to PTP socket: {e}. Trying again in 5 seconds …"
+                        );
+                        sleep(Duration::from_secs(5)).await;
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            offset,
+            sample_rate,
+        })
+    }
+
+    pub fn media_time(&self) -> MediaClockTimestamp {
+        media_time(
+            self.offset.load(std::sync::atomic::Ordering::Acquire),
+            self.sample_rate,
+        )
+    }
+}
+
+async fn read_offset(mut socket: TcpStream, task_offset: &Arc<AtomicI64>) {
+    log::info!("Connected to PTP socket.");
+    loop {
+        match socket.read_i64().await {
+            Ok(offset) => {
+                task_offset.store(offset, std::sync::atomic::Ordering::Release);
+            }
+            Err(e) => {
+                log::error!("Lost connection to PTP socket: {e}. Reconnecting in 5 seconds …");
+                sleep(Duration::from_secs(5)).await;
+                break;
+            }
+        }
+    }
+}
+
+pub fn media_time(offset: i64, sample_rate: usize) -> MediaClockTimestamp {
+    let timestamp = wrapped_media_time(sample_rate, offset);
+    MediaClockTimestamp {
+        timestamp,
+        sample_rate,
+    }
+}
+
+fn wrapped_media_time(sample_rate: usize, offset: i64) -> u32 {
+    wrap_u128(raw_media_time(sample_rate, offset))
+}
+
+fn raw_media_time(sample_rate: usize, offset: i64) -> u128 {
+    let now = system_time();
+    let nanos =
+        (now.tv_sec * Duration::from_secs(1).as_nanos() as i64 + now.tv_nsec + offset) as u128;
+    (nanos * sample_rate as u128) / std::time::Duration::from_secs(1).as_nanos()
+}
+
+pub fn system_time() -> timespec {
+    let mut tp = timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { clock_gettime(CLOCK_TAI, &mut tp) } == -1 {
+        // TODO handle error
+    }
+    tp
+}
 
 #[cfg(test)]
 mod test {

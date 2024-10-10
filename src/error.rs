@@ -56,6 +56,8 @@ pub enum RtpError {
     JackError(#[from] jack::Error),
     #[error("shared memory error: {0}")]
     ShmemError(#[from] ShmemError),
+    #[error("io error: {0}")]
+    IoError(#[from] io::Error),
 }
 
 pub type RtpResult<T> = Result<T, RtpError>;

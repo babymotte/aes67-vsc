@@ -1,8 +1,7 @@
-use crate::utils::{wrap_u128, MediaClockTimestamp};
-/**
+/*
  * This is in large parts copied with some modifications from https://crates.io/crates/statime-linux
  */
-use fixed::traits::LossyInto;
+
 use pnet::datalink::NetworkInterface;
 use rand::{rngs::StdRng, SeedableRng};
 use statime::{
@@ -30,6 +29,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     pin::{pin, Pin},
     sync::RwLock,
+    time::Duration,
 };
 use timestamped_socket::{
     interface::InterfaceName,
@@ -43,25 +43,18 @@ use tokio::{
 };
 use worterbuch_client::{topic, Worterbuch};
 
-trait PortClock:
-    Clock<Error = <LinuxClock as Clock>::Error> + PortTimestampToTime + Send + Sync
-{
-    fn clone_box(&self) -> Box<dyn PortClock>;
-}
-impl PortClock for LinuxClock {
-    fn clone_box(&self) -> Box<dyn PortClock> {
-        Box::new(self.clone())
-    }
-}
-impl PortClock for SharedClock<OverlayClock<LinuxClock>> {
-    fn clone_box(&self) -> Box<dyn PortClock> {
-        Box::new(self.clone())
-    }
-}
-type BoxedClock = Box<dyn PortClock>;
+use crate::utils::system_time;
 
-#[derive(Clone)]
-pub struct SharedOverlayClock(SharedClock<OverlayClock<LinuxClock>>);
+pub type PtpClock = SharedClock<OverlayClock<LinuxClock>>;
+
+pub fn current_offset(clock: &PtpClock) -> i64 {
+    let ptp_time = clock.now();
+    let system_time = system_time();
+
+    let diff_s = ptp_time.secs() as i64 - system_time.tv_sec;
+    let diff_ns = ptp_time.subsec_nanos() as i64 - system_time.tv_nsec;
+    diff_s * Duration::from_secs(1).as_nanos() as i64 + diff_ns
+}
 
 pin_project_lite::pin_project! {
     struct Timer {
@@ -106,36 +99,12 @@ impl Future for Timer {
     }
 }
 
-impl SharedOverlayClock {
-    fn clone_boxed(&self) -> BoxedClock {
-        Box::new(self.0.clone())
-    }
-
-    fn now_nanos(&self) -> u128 {
-        self.0.now().nanos().saturating_round().lossy_into()
-    }
-
-    pub fn media_clock(&self, sample_rate: usize) -> MediaClockTimestamp {
-        let timestamp = self.wrapped_media_clock(sample_rate);
-        MediaClockTimestamp::new(timestamp, sample_rate)
-    }
-
-    pub fn wrapped_media_clock(&self, sample_rate: usize) -> u32 {
-        wrap_u128(self.raw_media_clock(sample_rate))
-    }
-
-    fn raw_media_clock(&self, sample_rate: usize) -> u128 {
-        let nanos = self.now_nanos();
-        (nanos * sample_rate as u128) / std::time::Duration::from_secs(1).as_nanos()
-    }
-}
-
 pub async fn statime_linux(
     iface: NetworkInterface,
     ip: IpAddr,
     wb: Worterbuch,
     root_key: String,
-) -> SharedOverlayClock {
+) -> SharedClock<OverlayClock<LinuxClock>> {
     let mac = iface.mac.expect("we already checked this");
     let mac = [mac.0, mac.1, mac.2, mac.3, mac.4, mac.5];
 
@@ -159,8 +128,7 @@ pub async fn statime_linux(
     let time_properties_ds =
         TimePropertiesDS::new_arbitrary_time(false, false, TimeSource::InternalOscillator);
 
-    let system_clock =
-        SharedOverlayClock(SharedClock::new(OverlayClock::new(LinuxClock::CLOCK_TAI)));
+    let system_clock = SharedClock::new(OverlayClock::new(LinuxClock::CLOCK_TAI));
 
     // Leak to get a static reference, the ptp instance will be around for the rest
     // of the program anyway
@@ -176,25 +144,18 @@ pub async fn statime_linux(
 
     let (bmca_notify_sender, bmca_notify_receiver) = tokio::sync::watch::channel(false);
 
-    // let mut main_task_senders = Vec::with_capacity(1);
-    // let mut main_task_receivers = Vec::with_capacity(1);
-    // let mut ports = Vec::with_capacity(1);
-
     let tlv_forwarder = TlvForwarder::new();
 
     let interface = port_config.interface;
     let network_mode = port_config.network_mode;
-    let (port_clock, timestamping) = (
-        system_clock.clone_boxed(),
-        InterfaceTimestampMode::SoftwareAll,
-    );
+    let (port_clock, timestamping) = (system_clock.clone(), InterfaceTimestampMode::SoftwareAll);
 
     let rng = StdRng::from_entropy();
     let bind_phc = port_config.hardware_clock;
     let port = instance.add_port(
         port_config.into(),
         KalmanConfiguration::default(),
-        port_clock.clone_box(),
+        port_clock.clone(),
         rng,
     );
 
@@ -329,7 +290,7 @@ type BmcaPort = Port<
     InBmca,
     Option<Vec<ClockIdentity>>,
     StdRng,
-    BoxedClock,
+    PtpClock,
     KalmanFilter,
     RwLock<PtpInstanceState>,
 >;
@@ -347,7 +308,7 @@ async fn port_task<A: NetworkAddress + PtpTargetAddress>(
     mut general_socket: Socket<A, Open>,
     mut bmca_notify: tokio::sync::watch::Receiver<bool>,
     mut tlv_forwarder: TlvForwarder,
-    clock: BoxedClock,
+    clock: PtpClock,
 ) {
     let mut timers = Timers {
         port_sync_timer: pin!(Timer::new()),
@@ -467,7 +428,7 @@ async fn ethernet_port_task(
     mut socket: Socket<EthernetAddress, Open>,
     mut bmca_notify: tokio::sync::watch::Receiver<bool>,
     mut tlv_forwarder: TlvForwarder,
-    clock: BoxedClock,
+    clock: PtpClock,
 ) {
     let mut timers = Timers {
         port_sync_timer: pin!(Timer::new()),
@@ -585,7 +546,7 @@ async fn handle_actions<A: NetworkAddress + PtpTargetAddress>(
     general_socket: &mut Socket<A, Open>,
     timers: &mut Timers<'_>,
     tlv_forwarder: &TlvForwarder,
-    clock: &BoxedClock,
+    clock: &PtpClock,
 ) -> Option<(TimestampContext, Time)> {
     let mut pending_timestamp = None;
 
@@ -660,7 +621,7 @@ async fn handle_actions_ethernet(
     socket: &mut Socket<EthernetAddress, Open>,
     timers: &mut Timers<'_>,
     tlv_forwarder: &TlvForwarder,
-    clock: &BoxedClock,
+    clock: &PtpClock,
 ) -> Option<(TimestampContext, Time)> {
     let mut pending_timestamp = None;
 
@@ -781,62 +742,62 @@ fn publish_stats(
     spawn(async move {
         while let Some(stats) = instance_state_receiver.recv().await {
             wb.publish(
-                topic!(root_key, "status", "ptp", "current", "offsetFromMaster"),
+                topic!(root_key, "status", "current", "offsetFromMaster"),
                 &stats.current_ds.offset_from_master,
             )
             .await
             .ok();
             wb.publish(
-                topic!(root_key, "status", "ptp", "current", "stepsRemoved"),
+                topic!(root_key, "status", "current", "stepsRemoved"),
                 &stats.current_ds.steps_removed,
             )
             .await
             .ok();
 
             wb.set(
-                topic!(root_key, "status", "ptp", "default", "clock", "id"),
+                topic!(root_key, "status", "default", "clock", "id"),
                 &stats.default_ds.clock_identity,
             )
             .await
             .ok();
             wb.set(
-                topic!(root_key, "status", "ptp", "default", "clock", "quality"),
+                topic!(root_key, "status", "default", "clock", "quality"),
                 &stats.default_ds.clock_quality,
             )
             .await
             .ok();
             wb.set(
-                topic!(root_key, "status", "ptp", "default", "domain"),
+                topic!(root_key, "status", "default", "domain"),
                 &stats.default_ds.domain_number,
             )
             .await
             .ok();
             wb.set(
-                topic!(root_key, "status", "ptp", "default", "ports"),
+                topic!(root_key, "status", "default", "ports"),
                 &stats.default_ds.number_ports,
             )
             .await
             .ok();
             wb.set(
-                topic!(root_key, "status", "ptp", "default", "priority1"),
+                topic!(root_key, "status", "default", "priority1"),
                 &stats.default_ds.priority_1,
             )
             .await
             .ok();
             wb.set(
-                topic!(root_key, "status", "ptp", "default", "priority2"),
+                topic!(root_key, "status", "default", "priority2"),
                 &stats.default_ds.priority_2,
             )
             .await
             .ok();
             wb.set(
-                topic!(root_key, "status", "ptp", "default", "sdoID"),
+                topic!(root_key, "status", "default", "sdoID"),
                 &stats.default_ds.sdo_id,
             )
             .await
             .ok();
             wb.set(
-                topic!(root_key, "status", "ptp", "default", "slaveOnly"),
+                topic!(root_key, "status", "default", "slaveOnly"),
                 &stats.default_ds.slave_only,
             )
             .await
@@ -857,7 +818,7 @@ fn publish_stats(
             .await
             .ok();
             wb.set(
-                topic!(root_key, "status", "ptp", "parent", "grandmaster", "id"),
+                topic!(root_key, "status", "parent", "grandmaster", "id"),
                 &stats.parent_ds.grandmaster_identity,
             )
             .await
@@ -889,27 +850,27 @@ fn publish_stats(
             .await
             .ok();
             wb.set(
-                topic!(root_key, "status", "ptp", "parent", "port", "id"),
+                topic!(root_key, "status", "parent", "port", "id"),
                 &stats.parent_ds.parent_port_identity,
             )
             .await
             .ok();
 
             wb.set(
-                topic!(root_key, "status", "ptp", "pathTrace", "enabled"),
+                topic!(root_key, "status", "pathTrace", "enabled"),
                 &stats.path_trace_ds.enable,
             )
             .await
             .ok();
             wb.set(
-                topic!(root_key, "status", "ptp", "pathTrace", "list"),
+                topic!(root_key, "status", "pathTrace", "list"),
                 &stats.path_trace_ds.list,
             )
             .await
             .ok();
 
             wb.publish(
-                topic!(root_key, "status", "ptp", "time", "properties", "utcOffset"),
+                topic!(root_key, "status", "time", "properties", "utcOffset"),
                 &stats.time_properties_ds.current_utc_offset,
             )
             .await
@@ -928,7 +889,7 @@ fn publish_stats(
             .await
             .ok();
             wb.set(
-                topic!(root_key, "status", "ptp", "time", "properties", "isPtp"),
+                topic!(root_key, "status", "time", "properties", "isPtp"),
                 &stats.time_properties_ds.is_ptp(),
             )
             .await

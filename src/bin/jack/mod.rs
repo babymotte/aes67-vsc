@@ -17,9 +17,10 @@
 
 use aes67_vsc::{
     error::RtpResult,
-    ptp::statime_linux::SharedOverlayClock,
     status::{Output, Status, StatusApi},
-    utils::{init_buffer, open_shared_memory_buffers, AudioBuffer, MediaClockTimestamp},
+    utils::{
+        init_buffer, open_shared_memory_buffers, AudioBuffer, MediaClockTimestamp, RemoteMediaClock,
+    },
     AudioSystemConfig,
 };
 use jack::{
@@ -36,7 +37,7 @@ struct State {
     out_ports: Vec<Port<AudioOut>>,
     status: StatusApi,
     jack_media_clock: Option<MediaClockTimestamp>,
-    clock: SharedOverlayClock,
+    clock: RemoteMediaClock,
     input_buffer: AudioBuffer,
     output_buffer: AudioBuffer,
     input_sequence_numbers: Box<[Option<Seq>]>,
@@ -48,7 +49,7 @@ pub async fn run(
     inputs: usize,
     outputs: usize,
     status: StatusApi,
-    clock: SharedOverlayClock,
+    port: u16,
     mem_conf: AudioSystemConfig,
 ) -> RtpResult<()> {
     // TODO evaluate client status
@@ -72,6 +73,8 @@ pub async fn run(
 
     let input_sequence_numbers = init_buffer(inputs, |_| None);
     let output_sequence_numbers = init_buffer(inputs, |_| None);
+
+    let clock = RemoteMediaClock::connect(port, client.sample_rate()).await?;
 
     let process = ClosureProcessHandler::with_state(
         State {
@@ -105,7 +108,7 @@ pub async fn run(
 }
 
 fn process(state: &mut State, client: &Client, ps: &ProcessScope) -> Control {
-    let media_clock = state.clock.media_clock(client.sample_rate());
+    let media_clock = state.clock.media_time();
     let mut jack_media_clock = if let Some(it) = state.jack_media_clock {
         it
     } else {

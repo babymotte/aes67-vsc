@@ -17,18 +17,9 @@
 
 mod jack;
 
-use aes67_vsc::{
-    ptp::ptp,
-    status::StatusApi,
-    utils::{print_ifaces, set_realtime_priority},
-    AudioSystemConfig,
-};
+use aes67_vsc::{status::StatusApi, utils::set_realtime_priority, AudioSystemConfig};
 use clap::Parser;
-use miette::{miette, IntoDiagnostic, Result};
-use pnet::{
-    datalink::{self, NetworkInterface},
-    ipnetwork::IpNetwork,
-};
+use miette::{IntoDiagnostic, Result};
 use std::{io, time::Duration};
 #[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
 use tikv_jemallocator::Jemalloc;
@@ -51,6 +42,9 @@ struct Args {
     /// The number of outputs to create
     #[arg(short, long, default_value = "8")]
     outputs: usize,
+    /// PTP server port
+    #[arg(short, long, default_value = "9092")]
+    port: u16,
     /// The network interface to use for PTP
     #[arg()]
     iface: Option<String>,
@@ -61,29 +55,6 @@ async fn main() -> Result<()> {
     dotenv::dotenv().ok();
 
     let args: Args = Args::parse();
-
-    let iface_name = if let Some(it) = args.iface.as_deref() {
-        it
-    } else {
-        print_ifaces();
-        return Err(miette!("network interface not specified"));
-    };
-
-    let iface = if let Some(it) = get_network_iface(iface_name) {
-        it
-    } else {
-        return Err(miette!("network interface not found"));
-    };
-
-    let ip = if let Some(it) = iface.ips.iter().filter(|it| !it.ip().is_loopback()).next() {
-        it.to_owned()
-    } else {
-        return Err(miette!("network interface has no IP"));
-    };
-
-    if iface.mac.is_none() {
-        return Err(miette!("network interface has no MAC address"));
-    }
 
     tracing_subscriber::fmt()
         .with_writer(io::stderr)
@@ -96,7 +67,7 @@ async fn main() -> Result<()> {
 
     Toplevel::new(move |s| async move {
         s.start(SubsystemBuilder::new("aes67-vsc-jack", move |s| {
-            run(s, iface, ip, args.inputs, args.outputs, mem_conf)
+            run(s, args.inputs, args.outputs, mem_conf, args.port)
         }));
     })
     .catch_signals()
@@ -108,11 +79,10 @@ async fn main() -> Result<()> {
 
 async fn run(
     subsys: SubsystemHandle,
-    iface: NetworkInterface,
-    ip: IpNetwork,
     inputs: usize,
     outputs: usize,
     mem_conf: AudioSystemConfig,
+    port: u16,
 ) -> Result<()> {
     // TODO don't crash when wortebruch disconnects, try to reconnect and resume publishing stats
 
@@ -141,17 +111,12 @@ async fn run(
         .await
         .into_diagnostic()?;
 
-    let clock = ptp(iface, ip.ip(), wb.clone(), wb_namespace_key.clone()).await;
     let status = StatusApi::new(&subsys, wb.clone(), topic!(wb_namespace_key, "status"))
         .into_diagnostic()?;
 
-    jack::run(&subsys, inputs, outputs, status, clock, mem_conf)
+    jack::run(&subsys, inputs, outputs, status, port, mem_conf)
         .await
         .into_diagnostic()?;
-
-    // TODO get shared memory block
-    // TODO derive input/output numbers from memory block size
-    // TODO start JACK audio system
 
     select! {
         _ = subsys.on_shutdown_requested() => (),
@@ -159,15 +124,6 @@ async fn run(
     }
 
     Ok(())
-}
-
-fn get_network_iface(name: &str) -> Option<NetworkInterface> {
-    for iface in datalink::interfaces() {
-        if iface.name == name {
-            return Some(iface);
-        }
-    }
-    None
 }
 
 fn read_memory_config() -> Result<AudioSystemConfig> {

@@ -18,7 +18,7 @@
 pub mod statime_linux;
 
 use pnet::datalink::NetworkInterface;
-use statime_linux::{statime_linux, SharedOverlayClock};
+use statime_linux::{statime_linux, PtpClock};
 use std::net::IpAddr;
 use worterbuch_client::Worterbuch;
 
@@ -27,6 +27,6 @@ pub async fn ptp(
     ip: IpAddr,
     wb: Worterbuch,
     root_key: String,
-) -> SharedOverlayClock {
+) -> PtpClock {
     statime_linux(iface, ip, wb, root_key).await
 }

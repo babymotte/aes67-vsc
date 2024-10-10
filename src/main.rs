@@ -133,7 +133,7 @@ async fn run(args: Args, subsys: SubsystemHandle) -> Result<()> {
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|_| Uuid::new_v4().to_string());
     let wb_root_key = "aes67-vsc";
-    let wb_namespace_key = topic!(wb_root_key, hostname);
+    let wb_namespace_key = topic!(wb_root_key, hostname, "rtp");
 
     wb.set_client_name(&wb_namespace_key)
         .await

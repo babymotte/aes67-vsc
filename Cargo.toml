@@ -17,6 +17,10 @@ path = "src/main.rs"
 name = "aes67-vsc-jack"
 path = "src/bin/aes67_vsc_jack.rs"
 
+[[bin]]
+name = "aes67-vsc-ptp"
+path = "src/bin/aes67_vsc_ptp.rs"
+
 [features]
 jemalloc = ["tikv-jemallocator"]
 default = ["jemalloc"]

@@ -34,6 +34,7 @@ pub enum Status {
     UsedOutputChannels(usize, usize),
     Receiver(Receiver),
     Output(Output),
+    Ptp(Ptp),
 }
 
 pub enum Transmitter {
@@ -63,6 +64,11 @@ pub enum Output {
     Meter(usize, usize, u16),
     BufferUnderrun(usize, MediaClockTimestamp),
     BufferOverflow(usize, MediaClockTimestamp),
+}
+
+#[derive(Debug, Clone)]
+pub enum Ptp {
+    SystemOffset(i64),
 }
 
 #[derive(Clone)]
@@ -320,6 +326,11 @@ impl StatusActor {
                     topic!("outputs", channel, "buffer", "overflow"),
                     json!(value.timestamp),
                 )]),
+            },
+            Status::Ptp(ptp) => match ptp {
+                Ptp::SystemOffset(offset) => {
+                    Action::Set(vec![(topic!("systemClock", "offset"), json!(offset))])
+                }
             },
         }
     }
