@@ -17,7 +17,7 @@
 
 use crate::actor::{respond, Actor, ActorApi};
 use aes67_vsc::{
-    error::{RxError, SapError},
+    error::{RtpError, RxError, SapError},
     rtp::{RtpRxApi, RtpTxApi},
     sap::SapApi,
     utils::open_browser,
@@ -44,7 +44,7 @@ use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
-use worterbuch_client::{config::Config, Worterbuch};
+use worterbuch_client::config::Config;
 
 #[derive(Error, Debug)]
 enum UiError {
@@ -58,6 +58,8 @@ enum UiError {
     SdpError(#[from] sdp::Error),
     #[error("receiver error: {0}")]
     RxError(#[from] RxError),
+    #[error("rtp error: {0}")]
+    RtpError(#[from] RtpError),
 }
 
 struct UiActor {

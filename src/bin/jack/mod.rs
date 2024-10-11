@@ -42,6 +42,7 @@ struct State {
     output_buffer: AudioBuffer,
     input_sequence_numbers: Box<[Option<Seq>]>,
     output_sequence_numbers: Box<[Option<Seq>]>,
+    drift_counter: usize,
 }
 
 pub async fn run(
@@ -82,11 +83,12 @@ pub async fn run(
             out_ports,
             status,
             jack_media_clock,
-            clock,
+            clock: clock.clone(),
             input_buffer,
             output_buffer,
             input_sequence_numbers,
             output_sequence_numbers,
+            drift_counter: 0,
         },
         process,
         |_, _, _| Control::Continue,
@@ -97,6 +99,8 @@ pub async fn run(
     connect_ports(active_client.as_client(), outputs);
 
     subsys.on_shutdown_requested().await;
+
+    clock.close();
 
     if let Err(e) = active_client.deactivate() {
         log::error!("Error stopping JACK client: {e}");
@@ -118,21 +122,47 @@ fn process(state: &mut State, client: &Client, ps: &ProcessScope) -> Control {
 
     // TODO find out cause of jumps on port connect
     // TODO is JACK clock monotonic?
-    // TODO average drift across multiple loops to reduce jitter
 
     // severely out of sync, this will cause an audible jump
-    if drift.abs() >= client.buffer_size() as i64 {
-        log::warn!("JACK media clock is {drift} samples off, resetting it to system media clock");
-        jack_media_clock = media_clock;
-    } else
+
+    let skipped_clock = if drift.abs() >= client.buffer_size() as i64 {
+        state.drift_counter += 1;
+        let persisting = state.drift_counter > 10;
+        if persisting {
+            log::warn!(
+                "JACK media clock is {drift} samples off, resetting it to system media clock"
+            );
+            state
+                .status
+                .try_publish(Status::Output(Output::ClockOutOfSync(drift)))
+                .ok();
+            jack_media_clock = media_clock;
+        }
+        persisting
+    } else {
+        state.drift_counter = 0;
+        false
+    };
+
     // if jack clock is slightly off, bring them back together again
-    if drift < 0 {
+
+    if !skipped_clock && drift < -1 {
         // JACK media clock is BEHIND
         log::debug!("JACK media clock is {} samples late", drift.abs());
+        state
+            .status
+            .try_publish(Status::Output(Output::ClockAdjust(1)))
+            .ok();
         jack_media_clock = jack_media_clock.next();
-    } else if drift > 0 {
+    }
+
+    if !skipped_clock && drift > 1 {
         // JACK media clock is AHEAD
         log::debug!("JACK media clock is {} samples early", drift);
+        state
+            .status
+            .try_publish(Status::Output(Output::ClockAdjust(-1)))
+            .ok();
         jack_media_clock = jack_media_clock.previous();
     }
 

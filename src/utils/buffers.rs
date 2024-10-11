@@ -95,15 +95,7 @@ pub struct AudioBuffer {
 }
 
 impl AudioBuffer {
-    pub fn insert(&mut self, rtp_packet: &[u8], desc: &RxDescriptor, matrix: &OutputMatrix) {
-        let rtp = match RtpReader::new(rtp_packet) {
-            Ok(it) => it,
-            Err(e) => {
-                log::warn!("received malformed rtp packet: {e:?}");
-                return;
-            }
-        };
-
+    pub fn insert(&mut self, rtp: RtpReader, desc: &RxDescriptor, matrix: &OutputMatrix) {
         let reception_timestamp =
             MediaClockTimestamp::new(rtp.timestamp(), self.format.audio_format.sample_rate)
                 - desc.rtp_offset;

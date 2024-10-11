@@ -57,6 +57,7 @@ pub enum Receiver {
     BufferUsage(ReceiverId, usize, usize, usize),
     DroppedPackets(ReceiverId, usize),
     OutOfOrderPackets(ReceiverId, usize),
+    LatePackets(ReceiverId, usize),
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +65,8 @@ pub enum Output {
     Meter(usize, usize, u16),
     BufferUnderrun(usize, MediaClockTimestamp),
     BufferOverflow(usize, MediaClockTimestamp),
+    ClockOutOfSync(i64),
+    ClockAdjust(i64),
 }
 
 #[derive(Debug, Clone)]
@@ -312,6 +315,10 @@ impl StatusActor {
                     topic!("receivers", id, "packets", "outOfOrder"),
                     json!(count),
                 )]),
+                Receiver::LatePackets(id, count) => Action::Publish(vec![(
+                    topic!("receivers", id, "packets", "late"),
+                    json!(count),
+                )]),
             },
             Status::Output(output) => match output {
                 Output::Meter(id, channel, value) => Action::Publish(vec![(
@@ -326,6 +333,12 @@ impl StatusActor {
                     topic!("outputs", channel, "buffer", "overflow"),
                     json!(value.timestamp),
                 )]),
+                Output::ClockOutOfSync(diff) => {
+                    Action::Publish(vec![(topic!("outputs", "clock", "outOfSync"), json!(diff))])
+                }
+                Output::ClockAdjust(diff) => {
+                    Action::Publish(vec![(topic!("outputs", "clock", "adjust"), json!(diff))])
+                }
             },
             Status::Ptp(ptp) => match ptp {
                 Ptp::SystemOffset(offset) => {

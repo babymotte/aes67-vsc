@@ -58,6 +58,12 @@ pub enum RtpError {
     ShmemError(#[from] ShmemError),
     #[error("io error: {0}")]
     IoError(#[from] io::Error),
+    #[error("channel error: {0}")]
+    SendError(#[from] SendError<RxFunction>),
+    #[error("channel error: {0}")]
+    ReceiveError(#[from] RecvError),
+    #[error("status error: {0}")]
+    StatusError(#[from] StatusError),
 }
 
 pub type RtpResult<T> = Result<T, RtpError>;

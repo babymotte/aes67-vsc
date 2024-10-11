@@ -26,7 +26,7 @@ use std::{
     sync::{atomic::AtomicI64, Arc},
     time::Duration,
 };
-use tokio::{io::AsyncReadExt, net::TcpStream, spawn, time::sleep};
+use tokio::{io::AsyncReadExt, net::TcpStream, spawn, sync::mpsc, time::sleep};
 
 #[derive(Debug, Clone, Copy)]
 pub struct MediaClockTimestamp {
@@ -183,12 +183,14 @@ pub fn wrap_u64(value: u64) -> u32 {
 pub struct RemoteMediaClock {
     offset: Arc<AtomicI64>,
     sample_rate: usize,
+    close: mpsc::Sender<()>,
 }
 
 impl RemoteMediaClock {
     pub async fn connect(port: u16, sample_rate: usize) -> RtpResult<Self> {
         let offset = Arc::new(AtomicI64::new(0));
         let task_offset = offset.clone();
+        let (close, mut close_rx) = mpsc::channel(1);
 
         spawn(async move {
             loop {
@@ -198,7 +200,11 @@ impl RemoteMediaClock {
                 ))
                 .await
                 {
-                    Ok(socket) => read_offset(socket, &task_offset).await,
+                    Ok(socket) => {
+                        if !read_offset(socket, &task_offset, &mut close_rx).await {
+                            break;
+                        }
+                    }
                     Err(e) => {
                         log::error!(
                             "Could not connect to PTP socket: {e}. Trying again in 5 seconds …"
@@ -207,11 +213,13 @@ impl RemoteMediaClock {
                     }
                 }
             }
+            log::info!("PTP client stopped.");
         });
 
         Ok(Self {
             offset,
             sample_rate,
+            close,
         })
     }
 
@@ -221,11 +229,22 @@ impl RemoteMediaClock {
             self.sample_rate,
         )
     }
+
+    pub fn close(&self) {
+        self.close.try_send(()).ok();
+    }
 }
 
-async fn read_offset(mut socket: TcpStream, task_offset: &Arc<AtomicI64>) {
+async fn read_offset(
+    mut socket: TcpStream,
+    task_offset: &Arc<AtomicI64>,
+    close: &mut mpsc::Receiver<()>,
+) -> bool {
     log::info!("Connected to PTP socket.");
     loop {
+        if close.try_recv().is_ok() {
+            return false;
+        }
         match socket.read_i64().await {
             Ok(offset) => {
                 task_offset.store(offset, std::sync::atomic::Ordering::Release);
@@ -233,7 +252,7 @@ async fn read_offset(mut socket: TcpStream, task_offset: &Arc<AtomicI64>) {
             Err(e) => {
                 log::error!("Lost connection to PTP socket: {e}. Reconnecting in 5 seconds …");
                 sleep(Duration::from_secs(5)).await;
-                break;
+                return true;
             }
         }
     }

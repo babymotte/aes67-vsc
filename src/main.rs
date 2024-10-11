@@ -51,6 +51,9 @@ struct Args {
     /// The port to run the web UI on
     #[arg(short, long, default_value = "9090")]
     port: u16,
+    /// The port to run the web UI on
+    #[arg(long, default_value = "9092")]
+    ptp_port: u16,
     /// Number of input channels
     #[arg(short, long, default_value = "32")]
     inputs: usize,
@@ -187,8 +190,14 @@ async fn run(args: Args, subsys: SubsystemHandle, ip: IpNetwork) -> Result<()> {
     let status = StatusApi::new(&subsys, wb.clone(), topic!(wb_namespace_key, "status"))
         .into_diagnostic()?;
     let rtp_tx = RtpTxApi::new(&subsys).into_diagnostic()?;
-    let rtp_rx =
-        RtpRxApi::new(&subsys, status.clone(), ip.ip(), output_buffer).into_diagnostic()?;
+    let rtp_rx = RtpRxApi::new(
+        &subsys,
+        status.clone(),
+        ip.ip(),
+        output_buffer,
+        args.ptp_port,
+    )
+    .into_diagnostic()?;
     let sap = SapApi::new(&subsys, wb.clone(), wb_root_key.to_owned()).into_diagnostic()?;
 
     cleanup_discovery(&subsys, wb.clone(), wb_root_key.to_owned());

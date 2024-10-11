@@ -21,14 +21,15 @@ use super::{
 };
 use crate::{
     actor::{respond, Actor, ActorApi},
-    error::{RxError, RxResult},
+    error::{RtpError, RtpResult, RxError, RxResult},
     status::{Receiver, Status, StatusApi},
-    utils::{self, init_buffer, AudioBuffer},
+    utils::{self, init_buffer, AudioBuffer, MediaClockTimestamp, RemoteMediaClock},
     ReceiverId, SampleFormat,
 };
 use core::f32;
 use lazy_static::lazy_static;
 use regex::Regex;
+use rtp_rs::RtpReader;
 use sdp::{
     description::common::{Address, ConnectionInformation},
     SessionDescription,
@@ -257,7 +258,7 @@ pub struct RtpRxApi {
 
 impl ActorApi for RtpRxApi {
     type Message = RxFunction;
-    type Error = RxError;
+    type Error = RtpError;
 
     fn message_tx(&self) -> &mpsc::Sender<RxFunction> {
         &self.channel
@@ -270,13 +271,14 @@ impl RtpRxApi {
         status: StatusApi,
         local_ip: IpAddr,
         audio_buffer: AudioBuffer,
-    ) -> Result<Self, RxError> {
+        ptp_port: u16,
+    ) -> RtpResult<Self> {
         let (channel, commands) = mpsc::channel(1);
 
         subsys.start(SubsystemBuilder::new("rtp/rx", move |s| async move {
             let cancel = s.create_cancellation_token();
             let mut actor: RtpRxActor =
-                RtpRxActor::new(s, commands, status, local_ip, audio_buffer);
+                RtpRxActor::new(s, commands, status, local_ip, audio_buffer, ptp_port);
             actor.log_channel_consumption().await?;
             let res = actor.run("rtp-rx".to_owned(), cancel).await;
             log::info!("RX stopped.");
@@ -286,18 +288,20 @@ impl RtpRxApi {
         Ok(RtpRxApi { channel })
     }
 
-    pub async fn create_receiver(&self, sdp: SessionDescription) -> Result<(), RxError> {
+    pub async fn create_receiver(&self, sdp: SessionDescription) -> RtpResult<()> {
         self.send_message(|tx| RxFunction::CreateReceiver(sdp, tx))
-            .await
+            .await?;
+        Ok(())
     }
 
-    pub async fn delete_receiver(&self, id: ReceiverId) -> Result<(), RxError> {
+    pub async fn delete_receiver(&self, id: ReceiverId) -> RtpResult<()> {
         self.send_message(|tx| RxFunction::DeleteReceiver(id, tx))
-            .await
+            .await?;
+        Ok(())
     }
 }
 
-type Response<T> = oneshot::Sender<RxResult<T>>;
+type Response<T> = oneshot::Sender<RtpResult<T>>;
 
 #[derive(Debug)]
 pub enum RxFunction {
@@ -323,6 +327,7 @@ struct RtpRxActor {
     local_ip: IpAddr,
     active_ports: Box<[Option<usize>]>,
     audio_buffer: AudioBuffer,
+    ptp_port: u16,
 }
 
 impl Drop for RtpRxActor {
@@ -333,7 +338,7 @@ impl Drop for RtpRxActor {
 
 impl Actor for RtpRxActor {
     type Message = RxFunction;
-    type Error = RxError;
+    type Error = RtpError;
 
     async fn recv_message(&mut self) -> Option<RxFunction> {
         self.commands.recv().await
@@ -346,7 +351,7 @@ impl Actor for RtpRxActor {
         }
     }
 
-    async fn run(&mut self, name: String, cancel_token: CancellationToken) -> RxResult<()> {
+    async fn run(&mut self, name: String, cancel_token: CancellationToken) -> RtpResult<()> {
         loop {
             select! {
                 _ = cancel_token.cancelled() => {
@@ -371,6 +376,7 @@ impl RtpRxActor {
         status: StatusApi,
         local_ip: IpAddr,
         audio_buffer: AudioBuffer,
+        ptp_port: u16,
     ) -> Self {
         let max_channels = audio_buffer.format.audio_format.frame_format.channels;
         let receiver_ids = HashMap::new();
@@ -389,6 +395,7 @@ impl RtpRxActor {
             local_ip,
             active_ports,
             audio_buffer,
+            ptp_port,
         }
     }
 
@@ -400,7 +407,7 @@ impl RtpRxActor {
         self.audio_buffer.format.buffer_len
     }
 
-    async fn create_receiver(&mut self, sdp: SessionDescription) -> RxResult<()> {
+    async fn create_receiver(&mut self, sdp: SessionDescription) -> RtpResult<()> {
         // TODO fail for receivers with incompatible sample rate
 
         let session_id = RxDescriptor::session_id_from_sdp(&sdp);
@@ -417,12 +424,12 @@ impl RtpRxActor {
             {
                 id
             } else {
-                return Err(RxError::MaxChannelsExceeded(self.max_channels()));
+                return Err(RxError::MaxChannelsExceeded(self.max_channels()))?;
             }
         };
         let desc = RxDescriptor::new(receiver_id, &sdp, self.buffer_len())?;
         if self.used_channels + desc.channels > self.max_channels() {
-            return Err(RxError::MaxChannelsExceeded(self.max_channels()));
+            return Err(RxError::MaxChannelsExceeded(self.max_channels()))?;
         }
         log::info!("Creating receiver '{receiver_id}' for session '{session_id}' …",);
         self.used_channels += desc.channels;
@@ -437,12 +444,14 @@ impl RtpRxActor {
 
         self.activate_ports(changed_ports).await;
 
+        let clock = RemoteMediaClock::connect(self.ptp_port, desc.sample_rate).await?;
+
         let rx_desc = desc.clone();
         let rx_stat = self.status.clone();
         let matrix = self.matrix.clone();
         let buffer = self.audio_buffer.clone();
         let subsys = move |s| async move {
-            let receive_loop = ReceiveLoop::new(rx_desc, socket, rx_stat, matrix, buffer);
+            let receive_loop = ReceiveLoop::new(rx_desc, socket, rx_stat, matrix, buffer, clock);
             receive_loop.run(s).await;
             Ok::<(), RxError>(())
         };
@@ -464,9 +473,9 @@ impl RtpRxActor {
         Ok(())
     }
 
-    async fn delete_receiver(&mut self, receiver_id: ReceiverId) -> RxResult<()> {
+    async fn delete_receiver(&mut self, receiver_id: ReceiverId) -> RtpResult<()> {
         if receiver_id >= self.active_receivers.len() {
-            return Err(RxError::InvalidReceiverId(receiver_id));
+            return Err(RxError::InvalidReceiverId(receiver_id))?;
         }
 
         if let Some((desc, subsys)) = self.active_receivers[receiver_id].take() {
@@ -491,7 +500,7 @@ impl RtpRxActor {
             log::info!("Receiver {receiver_id} deleted.",);
             self.log_channel_consumption().await?;
         } else {
-            return Err(RxError::InvalidReceiverId(receiver_id));
+            return Err(RxError::InvalidReceiverId(receiver_id))?;
         };
 
         Ok(())
@@ -643,9 +652,17 @@ struct ReceiveLoop {
     min_buffer_usage: (usize, usize),
     status: StatusApi,
     out_of_order_packets: usize,
+    late_packets: usize,
     dropped_packets: usize,
     matrix: OutputMatrix,
     audio_buffer: AudioBuffer,
+    clock: RemoteMediaClock,
+}
+
+impl Drop for ReceiveLoop {
+    fn drop(&mut self) {
+        self.clock.close();
+    }
 }
 
 impl ReceiveLoop {
@@ -655,6 +672,7 @@ impl ReceiveLoop {
         status: StatusApi,
         matrix: OutputMatrix,
         audio_buffer: AudioBuffer,
+        clock: RemoteMediaClock,
     ) -> Self {
         let rtp_buffer = init_buffer(desc.rtp_packet_size(), |_| 0u8);
 
@@ -665,9 +683,11 @@ impl ReceiveLoop {
             min_buffer_usage: (0, 0),
             status,
             out_of_order_packets: 0,
+            late_packets: 0,
             dropped_packets: 0,
             matrix,
             audio_buffer,
+            clock,
         }
     }
 
@@ -691,8 +711,23 @@ impl ReceiveLoop {
         if addr.ip() == self.desc.origin_ip {
             self.update_buffer_usage();
             // TODO only insert packet if sequence number is consistent with timestamp
-            self.audio_buffer
-                .insert(&self.rtp_buffer[0..len], &self.desc, &self.matrix);
+
+            let rtp = match RtpReader::new(&self.rtp_buffer[0..len]) {
+                Ok(it) => it,
+                Err(e) => {
+                    log::warn!("received malformed rtp packet: {e:?}");
+                    return;
+                }
+            };
+
+            let timestamp = MediaClockTimestamp::new(rtp.timestamp(), self.desc.sample_rate);
+            if timestamp.playout_time(self.desc.link_offset) < self.clock.media_time() {
+                log::warn!("Late packet: {}", rtp.timestamp());
+                self.late_packets += 1;
+                return;
+            }
+
+            self.audio_buffer.insert(rtp, &self.desc, &self.matrix);
         } else {
             log::warn!("Received packet from wrong sender: {addr}");
         }
@@ -729,13 +764,19 @@ impl ReceiveLoop {
         self.reset_buffer_usage();
 
         self.status
+            .publish(Status::Receiver(Receiver::LatePackets(
+                self.desc.id,
+                self.late_packets,
+            )))
+            .await
+            .ok();
+        self.status
             .publish(Status::Receiver(Receiver::DroppedPackets(
                 self.desc.id,
                 self.dropped_packets,
             )))
             .await
             .ok();
-        self.dropped_packets = 0;
         self.status
             .publish(Status::Receiver(Receiver::OutOfOrderPackets(
                 self.desc.id,
@@ -743,7 +784,6 @@ impl ReceiveLoop {
             )))
             .await
             .ok();
-        self.out_of_order_packets = 0;
     }
 
     fn reset_buffer_usage(&mut self) {
